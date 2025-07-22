@@ -1,13 +1,14 @@
-mod localization;
-use crate::localization::*;
 use anyhow::{Context, Result, bail};
-use clap::{Arg, ArgAction, Command, crate_version, value_parser};
-use color_print::cformat;
+use clap::{
+    ArgAction, Args, Parser, Subcommand, ValueEnum, crate_version, value_parser,
+};
 use rpgmad_lib::Decrypter;
 use rvpacker_lib::{
-    json, purge, read, read_to_string_without_bom, types::*, write,
+    PurgerBuilder, RVPACKER_IGNORE_FILE, RVPACKER_METADATA_FILE, ReaderBuilder,
+    WriterBuilder, get_ini_title, get_system_title, json, types::*,
 };
-use serde_json::{Value, from_str, json, to_string};
+use serde::{Deserialize, Serialize};
+use serde_json::{from_str, to_string};
 use std::{
     ffi::OsStr,
     fs::{create_dir_all, read, read_dir, read_to_string, write},
@@ -17,750 +18,370 @@ use std::{
     process::exit,
     time::Instant,
 };
-use sys_locale::get_locale;
-use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*};
+use strum_macros::EnumIs;
 
-fn get_game_type(game_title: String) -> GameType {
-    let lowercased = game_title.to_lowercase();
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Metadata {
+    romanize: bool,
+    disable_custom_processing: bool,
+    trim: bool,
+    duplicate_mode: rvpacker_lib::DuplicateMode,
+}
 
-    if lowercased.contains("termina") {
-        GameType::Termina
-    } else if lowercased.contains("lisa") {
-        GameType::LisaRPG
-    } else {
+#[derive(Debug, Copy, Clone, ValueEnum)]
+enum DisableProcessing {
+    Maps = 1,
+    Other = 2,
+    System = 4,
+    Scripts = 8,
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+enum Engine {
+    MV,
+    MZ,
+}
+
+#[derive(Default, Debug, Copy, Clone, ValueEnum)]
+pub enum ReadMode {
+    #[default]
+    Default,
+    Append,
+    Force,
+}
+
+#[derive(Default, Debug, Copy, Clone, ValueEnum)]
+pub enum DuplicateMode {
+    #[default]
+    Allow,
+    Remove,
+}
+
+/// This tool allows to parse RPG Maker XP/VX/VXAce/MV/MZ games text to `.txt` files and write them back to their initial form. The program uses `original` or `data` directories for source files, and `translation` directory to operate with translation files. It will also decrypt any `.rgss` archive if it's present.
+#[derive(Parser, Debug)]
+#[command(name = "", version = crate_version!(), next_line_help = true, term_width = 120)]
+struct Cli {
+    /// Input directory, containing game files
+    #[arg(short, long, global = true, default_value = "./", value_name = "INPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 1)]
+    input_dir: PathBuf,
+
+    /// Output directory to output files to
+    #[arg(short, long, global = true, value_name = "OUTPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 2)]
+    output_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+
+    #[command(flatten)]
+    verbosity: clap_verbosity_flag::Verbosity,
+}
+
+#[derive(Debug, Subcommand, EnumIs)]
+pub enum Command {
+    /// Parses game files to `.txt` format, and decrypts any `.rgss` archive if it's present
+    Read(ReadArgs),
+
+    /// Writes translated game files to the output directory
+    Write(SharedArgs),
+
+    /// Purges lines without translation from translation files
+    Purge(PurgeArgs),
+
+    /// Provides the commands for JSON generation and writing
+    Json {
+        #[command(subcommand)]
+        subcommand: JsonSubcommand,
+    },
+
+    /// Decrypt/encrypt RPG Maker MV/MZ audio and image assets
+    Asset(AssetArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ReadArgs {
+    #[arg(short, long, hide = true, action = ArgAction::SetTrue)]
+    silent: bool,
+
+    /// Ignore entries from `.rvpacker-ignore` file. Use with `--mode append`
+    #[arg(short = 'I', long, action = ArgAction::SetTrue)]
+    ignore: bool,
+
+    #[command(flatten)]
+    shared: SharedArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct SharedArgs {
+    /// Defines how to read files.
+    /// `default` - If encounters existing translation files, aborts read.
+    /// `append` - Appends any new text from the game to the translation files, if the text is not already present. Unused lines are removed from translation files, and the lines order is sorted.
+    /// `force` - Force rewrites existing translation files
+    #[arg(
+        short,
+        long,
+        alias = "mode",
+        default_value = "default",
+        value_name = "MODE",
+        display_order = 3
+    )]
+    read_mode: ReadMode,
+
+    /// Removes the leading and trailing whitespace from extracted strings. Don't use this option unless you know that trimming the text won't cause any incorrect behavior
+    #[arg(short, long, action = ArgAction::SetTrue, display_order = 6)]
+    trim: bool,
+
+    /// If you parsing text from a Japanese game, that contains symbols like 「」, which are just the Japanese quotation marks, it automatically replaces these symbols by their western equivalents (in this case, '').
+    /// Will be automatically set if it was used in read
+    #[arg(short = 'R', long, action = ArgAction::SetTrue, display_order = 5)]
+    romanize: bool,
+
+    /// Disables built-in custom processing, implemented for some games.
+    /// Right now, implemented for the following titles: LISA: The Painful and its derivatives, Fear & Hunger 2: Termina.
+    /// Will be automatically set if it was used in read.
+    #[arg(short = 'D', long, alias = "no-custom", action = ArgAction::SetTrue, display_order = 93)]
+    disable_custom_processing: bool,
+
+    /// Skips processing specified files. plugins can be used interchangeably with scripts
+    #[arg(
+        long,
+        alias = "no",
+        value_delimiter = ',',
+        value_name = "FILES",
+        display_order = 94
+    )]
+    disable_processing: Vec<DisableProcessing>,
+
+    /// Controls how to handle duplicates in text
+    #[arg(
+        short,
+        long,
+        alias = "dup-mode",
+        default_value = "remove",
+        display_order = 93
+    )]
+    duplicate_mode: DuplicateMode,
+}
+
+#[derive(Debug, Args)]
+pub struct PurgeArgs {
+    /// Creates an ignore file from purged lines, to prevent their further appearance when reading with `--mode append`
+    #[arg(short, long, action = ArgAction::SetTrue, display_order = 23)]
+    pub create_ignore: bool,
+
+    #[command(flatten)]
+    pub shared: SharedArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JsonSubcommand {
+    /// Generates JSON representations of older engines' files in `json` directory
+    Generate {
+        #[arg(
+            short,
+            long,
+            alias = "mode",
+            default_value = "default",
+            value_name = "MODE"
+        )]
+        read_mode: ReadMode,
+    },
+
+    /// Writes JSON representations of older engines' files from `json` directory back to original files
+    Write,
+}
+
+#[derive(Debug, Args)]
+pub struct AssetArgs {
+    #[command(subcommand)]
+    subcommand: AssetSubcommand,
+
+    /// Encryption key for encrypt/decrypt operations
+    #[arg(short, long, value_name = "KEY")]
+    key: Option<String>,
+
+    /// File path (for single file processing or key extraction)
+    #[arg(short, long, value_name = "INPUT_FILE", value_parser = value_parser!(PathBuf))]
+    file: Option<PathBuf>,
+
+    /// Game engine (`mv` or `mz`)
+    #[arg(short, long, value_name = "ENGINE")]
+    engine: Option<Engine>,
+}
+
+#[derive(Debug, Subcommand, EnumIs)]
+pub enum AssetSubcommand {
+    /// Decrypts encrypted assets.
+    /// `.rpgmvo`/`.ogg_` => `.ogg`
+    /// `.rpgmvp`/`.png_` => `.png`
+    /// `.rpgmvm`/`.m4a_` => `.m4a`
+    Decrypt,
+
+    /// Encrypts `.png`/`.ogg`/`.m4a` assets.
+    /// `.ogg` => `.rpgmvo`/`.ogg_`
+    /// `.png` => `.rpgmvp`/`.png_`
+    /// `.m4a` => `.rpgmvm`/`.m4a_`
+    Encrypt,
+
+    /// Extracts key from the file, specified in `--file` argument
+    ExtractKey,
+}
+
+fn parse_metadata(metadata_file_path: &PathBuf) -> Result<Option<Metadata>> {
+    if !metadata_file_path.exists() {
+        return Ok(None);
+    }
+
+    let metadata_file_content = read_to_string(metadata_file_path)?;
+    let metadata = from_str(&metadata_file_content)?;
+    Ok(Some(metadata))
+}
+
+fn get_game_type(
+    game_title: &str,
+    disable_custom_processing: bool,
+) -> Result<GameType> {
+    Ok(if disable_custom_processing {
         GameType::None
-    }
-}
+    } else {
+        let lowercased = game_title.to_lowercase();
 
-fn log_errors(
-    results: impl IntoIterator<Item = Result<Outcome, Error>>,
-    loc: &Localization,
-    verbose: bool,
-) {
-    for result in results {
-        match result {
-            Err(err) => match err {
-                Error::ReadDirFailed { path, err } => {
-                    error!(
-                        "{path}: {loc} ({err})",
-                        path = path.display(),
-                        loc = loc.read_dir_failed_msg
-                    );
-                }
-                Error::AppendModeIsNotSupported => {
-                    error!("{loc}", loc = loc.append_mode_not_supported_msg);
-                }
-                Error::CreateDirFailed { path, err } => {
-                    error!(
-                        "{path}: {loc} ({err})",
-                        path = path.display(),
-                        loc = loc.create_dir_failed_msg
-                    );
-                }
-                Error::JSONParseFailed { file, err } => {
-                    error!(
-                        "{file}: {loc} ({err})",
-                        file = file.display(),
-                        loc = loc.json_parse_failed_msg
-                    );
-                }
-                Error::LoadFailed { file, err } => {
-                    error!(
-                        "{file}: {loc} ({err})",
-                        file = file.display(),
-                        loc = loc.load_failed_msg
-                    );
-                }
-                Error::PluginsFileMissing => {
-                    error!("{loc}", loc = loc.plugins_file_missing_msg);
-                }
-                Error::ReadFileFailed { file, err } => {
-                    error!(
-                        "{file}: {loc} ({err})",
-                        file = file.display(),
-                        loc = loc.read_file_failed_msg
-                    );
-                }
-                Error::WriteFileFailed { file, err } => {
-                    error!(
-                        "{file}: {loc} ({err})",
-                        file = file.display(),
-                        loc = loc.write_file_failed_msg
-                    );
-                }
-            },
-
-            Ok(outcome) => match outcome {
-                // this is quite important, so we always log it
-                Outcome::TXTAlreadyExist(path) => {
-                    info!(
-                        "{path}: {msg}",
-                        path = path.display(),
-                        msg = loc.translation_already_exist_msg
-                    );
-                }
-
-                _ => {
-                    if !verbose {
-                        return;
-                    }
-
-                    match outcome {
-                        Outcome::TXTAlreadyExist(_) => unreachable!(),
-
-                        Outcome::MapIsUnused(map) => {
-                            info!(
-                                "{map}: {msg}",
-                                map = map,
-                                msg = loc.map_is_unused_msg
-                            );
-                        }
-
-                        Outcome::GeneratedJSON(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.generated_json_msg
-                            );
-                        }
-
-                        Outcome::JSONAlreadyExist(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.json_already_exist_msg
-                            );
-                        }
-
-                        Outcome::MVMZAlreadyJSON => {
-                            info!("{msg}", msg = loc.mvmz_already_json_msg);
-                        }
-
-                        Outcome::NoTranslationForEntry { file, entry } => {
-                            info!(
-                                "{entry} ({file}): {msg}",
-                                entry = entry,
-                                msg = loc.no_translation_for_entry_msg
-                            );
-                        }
-
-                        Outcome::PurgedFile(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.purged_file_msg
-                            );
-                        }
-
-                        Outcome::ReadFile(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.read_file_msg
-                            );
-                        }
-
-                        Outcome::NotInFileFlags(flag) => {
-                            info!(
-                                "{flag:?}: {msg}",
-                                msg = loc.skipped_file_msg
-                            );
-                        }
-
-                        Outcome::WrittenFile(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.written_file_msg
-                            );
-                        }
-
-                        Outcome::WrittenJSON(file) => {
-                            info!(
-                                "{file}: {msg}",
-                                file = file.display(),
-                                msg = loc.written_json_msg
-                            );
-                        }
-                    }
-                }
-            },
-        }
-    }
-}
-
-fn preparse_args() -> Language {
-    let preparse = Command::new("preparse")
-        .disable_help_flag(true)
-        .disable_help_subcommand(true)
-        .disable_version_flag(true)
-        .ignore_errors(true)
-        .subcommands([
-            Command::new("read"),
-            Command::new("write"),
-            Command::new("purge"),
-            Command::new("json")
-                .subcommands([Command::new("write"), Command::new("generate")]),
-        ])
-        .args([Arg::new("language")
-            .short('l')
-            .long("language")
-            .global(true)
-            .value_parser(["ru", "en"])]);
-    let mut preparse_matches = preparse.get_matches();
-    let language_arg = preparse_matches.remove_one::<String>("language");
-
-    let language = language_arg.unwrap_or_else(|| {
-        let locale = get_locale().unwrap_or(String::from("en-US"));
-
-        if let Some((lang, _)) = locale.split_once('-') {
-            lang.to_owned()
+        if lowercased.contains("termina") {
+            GameType::Termina
+        } else if lowercased.contains("lisa") {
+            GameType::LisaRPG
         } else {
-            locale
+            GameType::None
         }
-    });
-
-    let language = match language.as_str() {
-        "ru" | "be" | "uk" => Language::Russian,
-        _ => Language::English,
-    };
-
-    language
-}
-
-fn setup_cli(localization: &Localization) -> Command {
-    let input_dir_arg = Arg::new("input-dir")
-        .short('i')
-        .long("input-dir")
-        .global(true)
-        .help(localization.input_dir_arg_desc)
-        .value_name(localization.input_path_arg_type)
-        .value_parser(value_parser!(PathBuf))
-        .default_value("./")
-        .hide_default_value(true)
-        .display_order(1);
-
-    let output_dir_arg = Arg::new("output-dir")
-        .short('o')
-        .long("output-dir")
-        .global(true)
-        .help(localization.output_dir_arg_desc)
-        .value_name(localization.output_path_arg_type)
-        .value_parser(value_parser!(PathBuf))
-        .display_order(2);
-
-    let read_mode_arg = Arg::new("read-mode")
-        .short('r')
-        .long("read-mode")
-        .alias("mode")
-        .value_parser(["default", "append", "force"])
-        .hide_default_value(true)
-        .default_value("default")
-        .value_name(localization.mode_arg_type)
-        .help(cformat!(
-            "{}\n<bold>[{} default, append, force]\n[{} default]\n[{} mode]</>",
-            localization.read_mode_arg_desc,
-            localization.allowed_values,
-            localization.default_value,
-            localization.aliases
-        ))
-        .display_order(3);
-
-    let romanize_flag = Arg::new("romanize")
-        .short('R')
-        .long("romanize")
-        .action(ArgAction::SetTrue)
-        .help(localization.romanize_desc)
-        .display_order(5);
-
-    let trim_flag = Arg::new("trim")
-        .short('t')
-        .help(localization.trim_flag_desc)
-        .long("trim")
-        .action(ArgAction::SetTrue)
-        .display_order(6);
-
-    let ignore_flag = Arg::new("ignore")
-        .short('I')
-        .help(localization.ignore_flag_desc)
-        .long("ignore")
-        .action(ArgAction::SetTrue)
-        .display_order(8);
-
-    let create_ignore_flag = Arg::new("create-ignore")
-        .short('c')
-        .help(localization.create_ignore_flag_desc)
-        .long("create-ignore")
-        .action(ArgAction::SetTrue)
-        .display_order(23);
-
-    let disable_custom_processing_flag = Arg::new("disable-custom-processing")
-        .short('D')
-        .long("disable-custom-processing")
-        .alias("no-custom")
-        .action(ArgAction::SetTrue)
-        .help(cformat!(
-            "{}\n<bold>[{} no-custom]</>",
-            localization.disable_custom_processing_desc,
-            localization.aliases
-        ))
-        .display_order(93);
-
-    let disable_processing_arg = Arg::new("disable-processing")
-        .long("disable-processing")
-        .alias("no")
-        .value_delimiter(',')
-        .value_name(localization.disable_processing_arg_type)
-        .help(cformat!(
-            "{}\n{} --disable-processing=\"maps,other,system\"\n<bold>[{} maps, other, system, plugins, scripts]\n[{} no]</>",
-            localization.disable_processing_arg_desc,
-            localization.example,
-            localization.allowed_values,
-            localization.aliases
-        ))
-        .value_parser(["maps", "other", "system", "plugins", "scripts"])
-        .display_order(94);
-
-    let duplicate_mode_arg = Arg::new("duplicate-mode")
-        .short('d')
-        .long("duplicate-mode")
-        .alias("dup-mode")
-        .help(cformat!(
-            "{}\n{} --duplicate-mode remove\n<bold>[{} allow, remove]\n[{} allow]\n[{} dup-mode]</>",
-            localization.duplicate_mode_arg_desc,
-            localization.example,
-            localization.allowed_values,
-            localization.default_value,
-            localization.aliases,
-        ))
-        .value_parser(["allow", "remove"])
-        .display_order(93);
-
-    let language_arg = Arg::new("language")
-        .short('l')
-        .long("language")
-        .value_name(localization.language_arg_type)
-        .global(true)
-        .help(cformat!(
-            "{}\n{} --language en<bold>\n[{} en, ru]</>",
-            localization.language_arg_desc,
-            localization.example,
-            localization.allowed_values,
-        ))
-        .value_parser(["en", "ru"])
-        .display_order(95);
-
-    let progress_flag = Arg::new("progress")
-        .short('P')
-        .long("progress")
-        .action(ArgAction::SetTrue)
-        .global(true)
-        .help(localization.progress_arg_desc)
-        .display_order(97);
-
-    let verbose_flag = Arg::new("verbose")
-        .short('v')
-        .long("verbose")
-        .action(ArgAction::SetTrue)
-        .global(true)
-        .help(localization.verbose_arg_desc)
-        .display_order(96);
-
-    let version_flag = Arg::new("version")
-        .short('V')
-        .long("version")
-        .action(ArgAction::Version)
-        .help(localization.version_flag_desc)
-        .display_order(98);
-
-    let help_flag = Arg::new("help")
-        .short('h')
-        .long("help")
-        .help(localization.help_arg_desc)
-        .action(ArgAction::Help)
-        .display_order(99);
-
-    let silent_flag = Arg::new("silent")
-        .short('s')
-        .long("silent")
-        .hide(true)
-        .action(ArgAction::SetTrue);
-
-    let read_subcommand = Command::new("read")
-        .disable_help_flag(true)
-        .help_template(localization.subcommand_help_template)
-        .about(localization.read_command_desc)
-        .args([silent_flag, ignore_flag])
-        .args([
-            &read_mode_arg,
-            &help_flag,
-            &trim_flag,
-            &romanize_flag,
-            &disable_custom_processing_flag,
-            &disable_processing_arg,
-            &duplicate_mode_arg,
-        ]);
-
-    let write_subcommand = Command::new("write")
-        .disable_help_flag(true)
-        .help_template(localization.subcommand_help_template)
-        .about(localization.write_command_desc)
-        .args([
-            &help_flag,
-            &trim_flag,
-            &romanize_flag,
-            &disable_custom_processing_flag,
-            &disable_processing_arg,
-            &duplicate_mode_arg,
-        ]);
-
-    let purge_subcommand = Command::new("purge")
-        .disable_help_flag(true)
-        .help_template(localization.subcommand_help_template)
-        .about(localization.purge_command_desc)
-        .args([create_ignore_flag])
-        .args([
-            &help_flag,
-            &trim_flag,
-            &romanize_flag,
-            &disable_custom_processing_flag,
-            &disable_processing_arg,
-            &duplicate_mode_arg,
-        ]);
-
-    let generate_json_subcommand = Command::new("generate")
-        .about(localization.generate_json_command_desc)
-        .disable_help_flag(true)
-        .arg(&read_mode_arg);
-
-    let write_json_subcommand = Command::new("write")
-        .about(localization.write_json_command_desc)
-        .disable_help_flag(true);
-
-    let json_subcommand = Command::new("json")
-        .disable_help_flag(true)
-        .help_template(localization.json_help_template)
-        .about(localization.json_command_desc)
-        .subcommands([generate_json_subcommand, write_json_subcommand])
-        .arg(&help_flag);
-
-    let key_arg = Arg::new("key")
-        .long("key")
-        .help(localization.key_arg_desc)
-        .value_name(localization.key_arg_type);
-
-    let file_arg = Arg::new("file")
-        .long("file")
-        .help(localization.file_arg_desc)
-        .value_name(localization.file_arg_type)
-        .value_parser(value_parser!(PathBuf));
-
-    let engine_arg = Arg::new("engine")
-        .long("engine")
-        .help(localization.engine_arg_desc)
-        .value_parser(["mv", "mz"])
-        .value_name(localization.engine_arg_type);
-
-    let decrypt_subcommand =
-        Command::new("decrypt").about(localization.decrypt_command_desc);
-    let encrypt_subcommand =
-        Command::new("encrypt").about(localization.encrypt_command_desc);
-    let extract_key_subcommand = Command::new("extract-key")
-        .about(localization.extract_key_command_desc);
-
-    let asset_subcommand = Command::new("asset")
-        .disable_help_flag(true)
-        .about(localization.asset_command_desc)
-        .subcommands([
-            decrypt_subcommand,
-            encrypt_subcommand,
-            extract_key_subcommand,
-        ])
-        .args([key_arg, file_arg, engine_arg])
-        .arg(&help_flag);
-
-    Command::new("")
-        .version(crate_version!())
-        .disable_version_flag(true)
-        .disable_help_subcommand(true)
-        .disable_help_flag(true)
-        .next_line_help(true)
-        .term_width(120)
-        .about(localization.about_msg)
-        .help_template(localization.help_template)
-        .subcommands([
-            read_subcommand,
-            write_subcommand,
-            purge_subcommand,
-            json_subcommand,
-            asset_subcommand,
-        ])
-        .args([
-            input_dir_arg,
-            output_dir_arg,
-            language_arg,
-            progress_flag,
-            help_flag,
-            version_flag,
-            verbose_flag,
-        ])
-        .hide_possible_values(true)
+    })
 }
 
 fn main() -> Result<()> {
     let mut start_time = Instant::now();
+    let cli = Cli::parse();
 
-    let language = preparse_args();
-    let localization = Localization::new(language);
-    let cli = setup_cli(&localization);
-
-    let matches = cli.get_matches();
-    let (subcommand, subcommand_matches) =
-        matches.subcommand().unwrap_or_else(|| {
-            warn!("{}", localization.no_subcommand_specified_msg);
-            exit(0);
-        });
-
-    let input_dir =
-        unsafe { matches.get_one::<PathBuf>("input-dir").unwrap_unchecked() };
-
-    if !input_dir.exists() {
-        bail!("{}", localization.input_dir_missing);
-    }
-
-    let output_dir = matches
-        .get_one::<PathBuf>("output-dir")
-        .unwrap_or(input_dir);
-
-    if !output_dir.exists() {
-        bail!("{}", localization.output_dir_missing)
-    }
-
-    tracing_subscriber::registry()
-        .with(
-            fmt::layer()
-                .without_time()
-                .with_target(false)
-                .with_level(true)
-                .with_thread_names(false)
-                .with_thread_ids(false)
-                .with_ansi(true),
-        )
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
+        .with_level(true)
+        .with_thread_names(false)
+        .with_thread_ids(false)
+        .with_ansi(true)
+        .with_max_level(cli.verbosity)
         .init();
 
-    let mut source_path = &input_dir.join("original");
-    let data_path = input_dir.join("data");
+    let input_dir = cli.input_dir;
 
-    if !source_path.exists() {
-        source_path = &data_path;
+    if !input_dir.exists() {
+        bail!("Input directory does not exist.");
     }
+
+    let output_dir = cli.output_dir.unwrap_or_else(|| input_dir.clone());
+
+    if !output_dir.exists() {
+        bail!("Output directory does not exist.")
+    }
+
+    let source_path = ["original", "data", "Data"]
+        .into_iter()
+        .find_map(|dir| {
+            let path = input_dir.join(dir);
+
+            if path.exists() {
+                return Some(path);
+            }
+
+            None
+        })
+        .context("Could not found `original` or `data`/`Data` directory.")?;
 
     let translation_path = &output_dir.join("translation");
-    create_dir_all(translation_path)?;
+    let metadata_file_path = &translation_path.join(RVPACKER_METADATA_FILE);
+    let ignore_file_path = &translation_path.join(RVPACKER_IGNORE_FILE);
 
-    let metadata_file_path = &translation_path.join(".rvpacker-metadata");
-    let ignore_file_path = &translation_path.join(".rvpacker-ignore");
-
-    let progress = matches.get_flag("progress");
-    let verbose = matches.get_flag("verbose");
-
-    let (engine_type, system_file_path, archive_path) =
-        if source_path.join("System.json").exists() {
-            (EngineType::New, source_path.join("System.json"), None)
-        } else if source_path.join("System.rvdata2").exists()
-            || input_dir.join("Game.rgss3a").exists()
+    let Some((engine_type, system_file_path, archive_path)) = [
+        (EngineType::New, source_path.join("System.json"), None),
+        (
+            EngineType::VXAce,
+            source_path.join("System.rvdata2"),
+            Some(input_dir.join("Game.rgss3a")),
+        ),
+        (
+            EngineType::VX,
+            source_path.join("System.rvdata"),
+            Some(input_dir.join("Game.rgss2a")),
+        ),
+        (
+            EngineType::XP,
+            source_path.join("System.rxdata"),
+            Some(input_dir.join("Game.rgssad")),
+        ),
+    ]
+    .into_iter()
+    .find_map(|(engine_type, system_file_path, archive_path)| {
+        if !system_file_path.exists()
+            && archive_path.as_ref().is_none_or(|path| !path.exists())
         {
-            (
-                EngineType::VXAce,
-                source_path.join("System.rvdata2"),
-                Some(input_dir.join("Game.rgss3a")),
-            )
-        } else if source_path.join("System.rvdata").exists()
-            || input_dir.join("Game.rgss2a").exists()
-        {
-            (
-                EngineType::VX,
-                source_path.join("System.rvdata"),
-                Some(input_dir.join("Game.rgss2a")),
-            )
-        } else if source_path.join("System.rxdata").exists()
-            || input_dir.join("Game.rgssad").exists()
-        {
-            (
-                EngineType::XP,
-                source_path.join("System.rxdata"),
-                Some(input_dir.join("Game.rgssad")),
-            )
-        } else if subcommand != "asset" {
-            bail!("{}", localization.could_not_determine_game_engine_msg);
-        } else {
-            (EngineType::New, source_path.join("System.json"), None)
-        };
+            return None;
+        }
 
-    let mut game_type = if subcommand == "asset"
-        || ["read", "write", "purge"].contains(&subcommand)
-            && subcommand_matches.get_flag("disable-custom-processing")
-    {
-        GameType::None
-    } else {
-        let game_title = if engine_type.is_new() {
-            let system_obj: Value =
-                from_str(&read_to_string_without_bom(&system_file_path)?)?;
-            unsafe {
-                system_obj["gameTitle"].as_str().unwrap_unchecked().into()
-            }
-        } else {
-            let ini_file_path = &input_dir.join("Game.ini");
-
-            if ini_file_path.exists() {
-                let ini_file_bytes = read(ini_file_path)?;
-                let mut content = String::new();
-
-                for encoding in [
-                    encoding_rs::UTF_8,
-                    encoding_rs::SHIFT_JIS,
-                    encoding_rs::GB18030,
-                    encoding_rs::WINDOWS_1252,
-                    encoding_rs::WINDOWS_1251,
-                ] {
-                    let (decoded, _, error) = encoding.decode(&ini_file_bytes);
-
-                    if !error {
-                        content = decoded.into_owned();
-                    }
-                }
-
-                if content.is_empty() {
-                    bail!("{}", localization.could_not_decrypt_ini_file_msg);
-                }
-
-                let title_line = unsafe {
-                    content
-                        .lines()
-                        .find(|line| line.to_lowercase().starts_with("title"))
-                        .unwrap_unchecked()
-                };
-                let game_title = unsafe {
-                    title_line
-                        .split_once('=')
-                        .unwrap_unchecked()
-                        .1
-                        .trim()
-                        .into()
-                };
-
-                game_title
-            } else {
-                bail!("{}", localization.game_ini_file_missing_msg)
-            }
-        };
-
-        get_game_type(game_title)
+        Some((engine_type, system_file_path, archive_path))
+    }) else {
+        bail!(
+            "Couldn't determine game engine. Check the existence of `System` file inside `original` or `data`/`Data` directory, or `.rgss` archive."
+        );
     };
 
-    if !game_type.is_none() {
-        info!("{}", localization.custom_processing_enabled_msg);
-    }
+    let ini_file_path = input_dir.join("Game.ini");
 
-    let mut read_mode = ReadMode::Default;
-    let mut trim = false;
-    let mut romanize = false;
-    let mut file_flags = FileFlags::all();
-    let mut duplicate_mode = DuplicateMode::Allow;
+    let get_game_title = || -> Result<String> {
+        Ok(if engine_type.is_new() {
+            get_system_title(&read_to_string(&system_file_path)?)?
+        } else {
+            String::from_utf8_lossy(&get_ini_title(&read(ini_file_path)?)?)
+                .into_owned()
+        })
+    };
 
-    if ["read", "write", "purge"].contains(&subcommand) {
-        romanize = subcommand_matches.get_flag("romanize");
-        trim = subcommand_matches.get_flag("trim");
+    match cli.command {
+        Command::Read(args) => {
+            let mut file_flags = FileFlags::all();
+            let mut romanize = args.shared.romanize;
+            let mut trim = args.shared.trim;
+            let mut duplicate_mode: rvpacker_lib::DuplicateMode =
+                unsafe { transmute(args.shared.duplicate_mode) };
+            let read_mode: rvpacker_lib::ReadMode =
+                unsafe { transmute(args.shared.read_mode) };
+            let silent = args.silent;
+            let ignore = args.ignore;
+            let mut disable_custom_processing =
+                args.shared.disable_custom_processing;
 
-        if let Some(disable_processing_args) =
-            subcommand_matches.get_many::<String>("disable-processing")
-        {
-            for disable_processing_of in disable_processing_args {
-                file_flags.remove(match disable_processing_of.as_str() {
-                    "maps" => FileFlags::Map,
-                    "other" => FileFlags::Other,
-                    "system" => FileFlags::System,
-                    "plugins" | "scripts" => FileFlags::Scripts,
-                    _ => unreachable!(),
-                })
-            }
-        }
-
-        if let Some(duplicate_mode_arg) =
-            subcommand_matches.get_one::<String>("duplicate-mode")
-        {
-            if duplicate_mode_arg == "remove" {
-                duplicate_mode = DuplicateMode::Remove;
-            }
-        }
-    }
-
-    if ["read"].contains(&subcommand) {
-        let mode = subcommand_matches
-            .get_one::<String>("read-mode")
-            .map(|x| x.as_str())
-            .unwrap_or("default");
-
-        read_mode = match mode {
-            "default" => ReadMode::Default,
-            "append" => ReadMode::Append,
-            "force" => ReadMode::Force,
-            _ => unreachable!(),
-        }
-    }
-
-    if read_mode.is_append() || ["write", "purge"].contains(&subcommand) {
-        if let Ok(metadata_file_content) = read_to_string(metadata_file_path) {
-            let metadata: Value = from_str(&metadata_file_content)?;
-            let romanize_metadata =
-                unsafe { metadata["romanize"].as_bool().unwrap_unchecked() };
-            let disable_custom_processing_metadata = unsafe {
-                metadata["disableCustomProcessing"]
-                    .as_bool()
-                    .unwrap_unchecked()
-            };
-            let trim_metadata = metadata["trim"].as_bool().unwrap_or(false);
-            let duplicate_mode_metadata = metadata["duplicateMode"].as_u64();
-
-            if romanize_metadata {
-                info!("{}", localization.enabling_romanize_metadata_msg);
-                romanize = romanize_metadata;
+            for arg in args.shared.disable_processing {
+                file_flags.remove(FileFlags::from_bits_truncate(arg as u8));
             }
 
-            if disable_custom_processing_metadata && !game_type.is_none() {
-                info!(
-                    "{}",
-                    localization.disabling_custom_processing_metadata_msg
-                );
-                game_type = GameType::None;
+            let game_title = get_game_title()?;
+
+            let game_type =
+                get_game_type(&game_title, disable_custom_processing)?;
+
+            if read_mode.is_append() {
+                if let Some(metadata) = parse_metadata(metadata_file_path)? {
+                    Metadata {
+                        romanize,
+                        trim,
+                        duplicate_mode,
+                        disable_custom_processing,
+                    } = metadata;
+                }
             }
-
-            if trim_metadata {
-                info!("{}", localization.enabling_trim_metadata_msg);
-                trim = trim_metadata;
-            }
-
-            if let Some(dup_mode) = duplicate_mode_metadata {
-                info!("{}", localization.setting_duplicate_mode_metadata_msg);
-                duplicate_mode =
-                    unsafe { transmute::<u8, DuplicateMode>(dup_mode as u8) };
-            }
-        }
-    }
-
-    match subcommand {
-        "read" => {
-            use read::*;
-
-            let silent = subcommand_matches.get_flag("silent");
-            let ignore = subcommand_matches.get_flag("ignore");
-            let disable_custom_processing =
-                subcommand_matches.get_flag("disable-custom-processing");
 
             if read_mode.is_force() && !silent {
                 let start = Instant::now();
-                warn!("{}", localization.force_mode_warning);
+                println!(
+                    "WARNING! Force mode will forcefully rewrite all your translation files. Input 'Y' to continue."
+                );
 
                 let mut buf = String::with_capacity(4);
                 stdin().read_line(&mut buf)?;
@@ -773,262 +394,283 @@ fn main() -> Result<()> {
             }
 
             if !read_mode.is_append() {
-                let metadata = json!({ "romanize": romanize,
-                                                "disableCustomProcessing": disable_custom_processing,
-                                                "trim": trim,
-                                                "duplicateMode": duplicate_mode });
+                let metadata = Metadata {
+                    romanize,
+                    disable_custom_processing,
+                    trim,
+                    duplicate_mode,
+                };
+
                 write(metadata_file_path, to_string(&metadata)?)?;
             } else if ignore && !ignore_file_path.exists() {
-                error!("{}", localization.ignore_file_does_not_exist_msg);
-                exit(0);
+                bail!(
+                    "`.rvpacker-ignore` file does not exist. Aborting execution."
+                );
             }
 
             if let Some(archive_path) = archive_path {
-                if archive_path.exists() && !system_file_path.exists() {
-                    let bytes = read(archive_path)?;
-                    let mut decrypter =
-                        Decrypter::new().force(read_mode.is_force());
-                    decrypter.extract(&bytes, input_dir)?;
+                if !system_file_path.exists() {
+                    let archive_data = read(archive_path)?;
+                    let decrypted_files =
+                        Decrypter::new().decrypt(&archive_data)?;
+
+                    for file in decrypted_files {
+                        let path = String::from_utf8_lossy(&file.path);
+                        let output_file_path = input_dir.join(path.as_ref());
+
+                        if let Some(parent) = output_file_path.parent() {
+                            create_dir_all(parent)?;
+                        }
+
+                        write(output_file_path, file.content)?;
+                    }
                 }
             }
 
-            let results = ReaderBuilder::new()
+            ReaderBuilder::new()
                 .with_flags(file_flags)
                 .romanize(romanize)
                 .game_type(game_type)
                 .read_mode(read_mode)
-                .logging(progress)
                 .ignore(ignore)
                 .trim(trim)
                 .duplicate_mode(duplicate_mode)
                 .build()
-                .read(source_path, translation_path, engine_type)?;
-
-            log_errors(results, &localization, verbose);
+                .read(&source_path, translation_path, engine_type)?;
         }
-        "write" => {
-            use write::*;
 
+        Command::Write(args) => {
             if !translation_path.exists() {
-                bail!("{}", localization.translation_dir_missing);
+                bail!(
+                    "`translation` directory in the input directory does not exist."
+                );
             }
 
-            let results = WriterBuilder::new()
+            let mut file_flags = FileFlags::all();
+            let mut romanize = args.romanize;
+            let mut trim = args.trim;
+            let mut duplicate_mode: rvpacker_lib::DuplicateMode =
+                unsafe { transmute(args.duplicate_mode) };
+            let mut disable_custom_processing = args.disable_custom_processing;
+
+            for arg in args.disable_processing {
+                file_flags.remove(FileFlags::from_bits_truncate(arg as u8));
+            }
+
+            if let Some(metadata) = parse_metadata(metadata_file_path)? {
+                Metadata {
+                    romanize,
+                    trim,
+                    duplicate_mode,
+                    disable_custom_processing,
+                } = metadata;
+            }
+
+            let game_title = get_game_title()?;
+
+            let game_type =
+                get_game_type(&game_title, disable_custom_processing)?;
+
+            WriterBuilder::new()
                 .with_flags(file_flags)
                 .romanize(romanize)
-                .logging(progress)
                 .game_type(game_type)
                 .trim(trim)
                 .duplicate_mode(duplicate_mode)
                 .build()
                 .write(
-                    source_path,
+                    &source_path,
                     translation_path,
-                    output_dir,
+                    &output_dir,
                     engine_type,
                 )?;
-
-            log_errors(results, &localization, verbose);
         }
-        "purge" => {
-            use purge::*;
-            let create_ignore = subcommand_matches.get_flag("create-ignore");
 
-            let results = PurgerBuilder::new()
+        Command::Purge(args) => {
+            let mut file_flags = FileFlags::all();
+            let create_ignore = args.create_ignore;
+            let mut romanize = args.shared.romanize;
+            let mut trim = args.shared.trim;
+            let mut duplicate_mode: rvpacker_lib::DuplicateMode =
+                unsafe { transmute(args.shared.duplicate_mode) };
+            let mut disable_custom_processing =
+                args.shared.disable_custom_processing;
+
+            for arg in args.shared.disable_processing {
+                file_flags.remove(FileFlags::from_bits_truncate(arg as u8));
+            }
+
+            if let Some(metadata) = parse_metadata(metadata_file_path)? {
+                Metadata {
+                    romanize,
+                    trim,
+                    duplicate_mode,
+                    disable_custom_processing,
+                } = metadata;
+            }
+
+            let game_title = get_game_title()?;
+
+            let game_type =
+                get_game_type(&game_title, disable_custom_processing)?;
+
+            PurgerBuilder::new()
                 .with_flags(file_flags)
                 .romanize(romanize)
-                .logging(progress)
                 .game_type(game_type)
                 .trim(trim)
                 .duplicate_mode(duplicate_mode)
                 .create_ignore(create_ignore)
                 .build()
-                .purge(source_path, translation_path, engine_type)?;
-
-            log_errors(results, &localization, verbose);
+                .purge(&source_path, translation_path, engine_type)?;
         }
-        "json" => {
+
+        Command::Json { subcommand } => {
             use json::*;
-            let (json_subcommand, json_subcommand_matches) =
-                unsafe { subcommand_matches.subcommand().unwrap_unchecked() };
 
             let json_path = input_dir.join("json");
             let json_output_path = input_dir.join("json-output");
 
-            match json_subcommand {
-                "generate" => {
-                    let mode = json_subcommand_matches
-                        .get_one::<String>("read-mode")
-                        .map(|x| x.as_str())
-                        .unwrap_or("default");
+            match subcommand {
+                JsonSubcommand::Generate { read_mode } => {
+                    let read_mode: rvpacker_lib::ReadMode =
+                        unsafe { transmute(read_mode) };
 
-                    read_mode = match mode {
-                        "default" => ReadMode::Default,
-                        "append" => ReadMode::Append,
-                        "force" => ReadMode::Force,
-                        _ => unreachable!(),
-                    };
-
-                    let results =
-                        generate(source_path, &json_path, read_mode, progress);
-                    log_errors(results, &localization, verbose);
+                    generate(&source_path, &json_path, read_mode.is_force())?;
                 }
-                "write" => {
-                    let results = write(
-                        json_path,
-                        json_output_path,
-                        engine_type,
-                        progress,
-                    );
-                    log_errors(results, &localization, verbose);
+                JsonSubcommand::Write => {
+                    write(json_path, json_output_path, engine_type)?;
                 }
-                _ => unreachable!(),
             }
         }
-        "asset" => {
+
+        Command::Asset(args) => {
             use asset_decrypter::*;
 
-            let image_subcommand = unsafe {
-                subcommand_matches.subcommand_name().unwrap_unchecked()
-            };
+            let key = args.key;
+            let file = args.file;
+            let engine =
+                args.engine.context("`--engine` argument is required.")?;
 
-            let key = subcommand_matches.get_one::<String>("key");
-            let file = subcommand_matches.get_one::<PathBuf>("file");
-            let engine: &str =
-                subcommand_matches
-                    .get_one::<String>("engine")
-                    .context(localization.engine_argument_required_msg)?;
+            if let Some(ref file) = file {
+                if !file.is_file() {
+                    bail!(
+                        "`--file` argument is missing. It's required in `extract_key` command."
+                    );
+                }
+            } else if args.subcommand.is_extract_key() {
+                bail!("`--file` argument expects a file.")
+            }
 
             let mut decrypter = Decrypter::new();
 
-            if key.is_none() && matches!(image_subcommand, "encrypt") {
+            if key.is_none() && args.subcommand.is_encrypt() {
                 decrypter.set_key_from_str(DEFAULT_KEY)?
             } else {
-                decrypter.set_key_from_str(unsafe { key.unwrap_unchecked() })?
+                decrypter
+                    .set_key_from_str(&unsafe { key.unwrap_unchecked() })?
             };
 
-            match image_subcommand {
-                "extract-key" => {
-                    let file =
-                        file.context(localization.file_argument_missing_msg)?;
+            if args.subcommand.is_extract_key() {
+                let file = unsafe { file.unwrap_unchecked() };
+                let filename = unsafe { file.file_name().unwrap_unchecked() };
+                let extension = unsafe { file.extension().unwrap_unchecked() };
 
-                    let filename = file
-                        .file_name()
-                        .context(localization.file_argument_is_not_file_msg)?;
+                let content: String;
 
-                    let content: String;
+                let key = if filename == "System.json" {
+                    content = read_to_string(file)?;
+                    let index = unsafe {
+                        content.rfind("encryptionKey").unwrap_unchecked()
+                    } + "encryptionKey\":".len();
+                    &content[index..].trim().trim_matches('"')[..KEY_LENGTH]
+                } else if extension == "png_" || extension == "rpgmvp" {
+                    let buf = read(file)?;
 
-                    let key = if filename == "System.json" {
-                        content = read_to_string(file)?;
-                        let index = unsafe {
-                            content.rfind("encryptionKey").unwrap_unchecked()
-                        } + "encryptionKey\":".len();
-                        &content[index..].trim().trim_matches('"')[..KEY_LENGTH]
-                    } else {
-                        let buf = read(file)?;
-                        decrypter.set_key_from_image(&buf);
-                        decrypter.key().unwrap()
-                    };
+                    decrypter.set_key_from_image(&buf);
+                    unsafe { decrypter.key().unwrap_unchecked() }
+                } else {
+                    bail!(
+                        "Key can be extracted only from `System.json` or `.png_`/`.rpgmvp` file."
+                    );
+                };
 
-                    info!("Encryption key: {key}");
-                }
+                println!("Encryption key: {key}");
+            } else {
+                let mut process_file = |path: &PathBuf,
+                                        filename: &OsStr,
+                                        extension: &str|
+                 -> Result<()> {
+                    let data = read(path)?;
 
-                "decrypt" | "encrypt" => {
-                    let mut process_file = |path: &PathBuf,
-                                            filename: &OsStr,
-                                            extension: &str|
-                     -> Result<()> {
-                        let data = read(path)?;
-
-                        let (processed, new_ext) = match image_subcommand {
-                            "decrypt" => {
-                                let decrypted = decrypter.decrypt(&data);
-                                let new_ext = match extension {
-                                    "rpgmvp" | "png_" => "png",
-                                    "rpgmvo" | "ogg_" => "ogg",
-                                    "rpgmvm" | "m4a_" => "m4a",
-                                    _ => unreachable!(),
-                                };
-                                (decrypted, new_ext)
-                            }
-                            "encrypt" => {
-                                let encrypted = decrypter.encrypt(&data)?;
-                                let new_ext = match (engine, extension) {
-                                    ("mv", "png") => "rpgmvp",
-                                    ("mv", "ogg") => "rpgmvo",
-                                    ("mv", "m4a") => "rpgmvm",
-                                    ("mz", "png") => "png_",
-                                    ("mz", "ogg") => "ogg_",
-                                    ("mz", "m4a") => "m4a_",
-                                    _ => unreachable!(),
-                                };
-                                (encrypted, new_ext)
-                            }
+                    let (processed, new_ext) = if args.subcommand.is_decrypt() {
+                        let decrypted = decrypter.decrypt(&data);
+                        let new_ext = match extension {
+                            "rpgmvp" | "png_" => "png",
+                            "rpgmvo" | "ogg_" => "ogg",
+                            "rpgmvm" | "m4a_" => "m4a",
                             _ => unreachable!(),
                         };
-
-                        let output_file = output_dir.join(
-                            PathBuf::from(filename).with_extension(new_ext),
-                        );
-                        write(output_file, processed)?;
-
-                        Ok(())
-                    };
-
-                    let exts: &[&str] = match image_subcommand {
-                        "encrypt" => &["png", "ogg", "m4a"],
-                        "decrypt" => &[
-                            "rpgmvp", "rpgmvo", "rpgmvm", "ogg_", "png_",
-                            "m4a_",
-                        ],
-                        _ => unreachable!(),
-                    };
-
-                    if let Some(file) = &file {
-                        let filename = file.file_name().context(
-                            localization.file_argument_is_not_file_msg,
-                        )?;
-                        let extension = unsafe {
-                            file.extension()
-                                .unwrap_unchecked()
-                                .to_str()
-                                .unwrap_unchecked()
+                        (decrypted, new_ext)
+                    } else {
+                        let encrypted = decrypter.encrypt(&data)?;
+                        let new_ext = match (engine, extension) {
+                            (Engine::MV, "png") => "rpgmvp",
+                            (Engine::MV, "ogg") => "rpgmvo",
+                            (Engine::MV, "m4a") => "rpgmvm",
+                            (Engine::MZ, "png") => "png_",
+                            (Engine::MZ, "ogg") => "ogg_",
+                            (Engine::MZ, "m4a") => "m4a_",
+                            _ => unreachable!(),
                         };
+                        (encrypted, new_ext)
+                    };
+
+                    let output_file = output_dir
+                        .join(PathBuf::from(filename).with_extension(new_ext));
+                    write(output_file, processed)?;
+
+                    Ok(())
+                };
+
+                let exts: &[&str] = if args.subcommand.is_encrypt() {
+                    &["png", "ogg", "m4a"]
+                } else {
+                    &["rpgmvp", "rpgmvo", "rpgmvm", "ogg_", "png_", "m4a_"]
+                };
+
+                if let Some(file) = &file {
+                    let filename =
+                        unsafe { file.file_name().unwrap_unchecked() };
+                    let extension = unsafe {
+                        file.extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_unchecked()
+                    };
+
+                    if exts.contains(&extension) {
+                        process_file(file, filename, extension)?;
+                    }
+                } else {
+                    for entry in read_dir(input_dir)?.flatten() {
+                        let path = entry.path();
+                        let filename = entry.file_name();
+                        let extension =
+                            match path.extension().and_then(|ext| ext.to_str())
+                            {
+                                Some(ext) => ext,
+                                None => continue,
+                            };
 
                         if exts.contains(&extension) {
-                            process_file(file, filename, extension)?;
-                        }
-                    } else {
-                        for entry in read_dir(input_dir)?.flatten() {
-                            let path = entry.path();
-                            let filename = entry.file_name();
-                            let extension = match path.extension() {
-                                Some(ext) => ext,
-                                None => continue,
-                            };
-
-                            let extension = match extension.to_str() {
-                                Some(ext) => ext,
-                                None => continue,
-                            };
-
-                            if exts.contains(&extension) {
-                                process_file(&path, &filename, extension)?;
-                            }
+                            process_file(&path, &filename, extension)?;
                         }
                     }
                 }
-                _ => unreachable!(),
             }
         }
-        _ => unreachable!(),
     }
 
-    info!(
-        "{} {:.2}s",
-        localization.elapsed_time_msg,
-        start_time.elapsed().as_secs_f32()
-    );
-
+    println!("Elapsed: {:.2}s", start_time.elapsed().as_secs_f32());
     Ok(())
 }

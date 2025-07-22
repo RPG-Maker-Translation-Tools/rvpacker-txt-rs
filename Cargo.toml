@@ -1,18 +1,21 @@
 [package]
 name = "rvpacker-txt-rs"
-version = "8.0.0"
+version = "9.0.0"
 edition = "2021"
 
 [dependencies]
 sys-locale = "0.3.2"
-clap = { version = "4.5.41", features = ["wrap_help", "cargo"] }
+clap = { version = "4.5.41", features = ["wrap_help", "cargo", "derive"] }
 color-print = "0.3.7"
-rpgmad-lib = "2.0.0"
-rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "8.0.0", features = ["serde"] }
+rpgmad-lib = "3.0.0"
+rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "9.0.0" }
 encoding_rs = "0.8.35"
-asset_decrypter = { package = "rpgm-asset-decrypter-lib", version = "2.0.0" }
-serde_json = { version = "1.0.140", features = ["preserve_order"] }
+asset_decrypter = { package = "rpgm-asset-decrypter-lib", version = "2.1.0" }
+serde_json = { version = "1.0.141", features = ["preserve_order"] }
 getset = "0.1.6"
 anyhow = "1.0.98"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
+strum_macros = "0.27.2"
+serde = "1.0.219"
+clap-verbosity-flag = { version = "3.0.3", default-features = false, features = ["tracing"] }
