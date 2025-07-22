@@ -23,57 +23,17 @@ Translation is Russian, but the point is to get how to properly translate this p
 
 ## Installation
 
-You can download binary files in the Releases section.
-
-Files with the `.exe` extension are designed for Windows x64, while files without an extension are designed for Linux x64.
+You can download executable for your system in Releases section.
 
 ## Usage
 
 You can get help on usage by calling `rvpacker-txt-rs -h.`
 
-```text
-This tool allows to parse RPG Maker XP/VX/VXAce/MV/MZ games text to .txt files and write them back to their initial
-form. The program uses "original" or "data" directories for source files, and "translation" directory to operate with
-translation files. It will also decrypt any .rgss archive if it's present.
-
-Usage: rvpacker-txt-rs COMMAND [OPTIONS]
-
-Commands:
-  read
-          Parses game files to .txt format, and decrypts any .rgss archive if it's present.
-  write
-          Writes translated game files to the "output" directory.
-  purge
-          Purges lines without translation from ".txt" translation files.
-  json
-          Provides the commands for JSON generation and writing.
-  asset
-          Decrypt/encrypt RPG Maker MV/MZ audio and image assets.
-
-Options:
-  -i, --input-dir <INPUT_PATH>
-          Input directory, containing game files.
-  -o, --output-dir <OUTPUT_PATH>
-          Output directory to output files to.
-  -l, --language <LANGUAGE>
-          Sets the localization of the tool to the selected language.
-          Example: --language en
-          [Allowed values: en, ru]
-  -v, --verbose
-          Outputs full informating about processed files.
-  -P, --progress
-          Enables real-time progress logging.
-  -V, --version
-          Show program version.
-  -h, --help
-          Prints the program help message or for the entered subcommand.
-```
-
 Examples:
 
-`rvpacker-txt-rs read -i "E:/Documents/RPGMakerGame"` parses the text of the game into the `translation` folder of the specified directory.
+`rvpacker-txt-rs read -i "C:/Game"` parses the text of the game into the `translation` folder of the specified directory.
 
-`rvpacker-txt-rs write -i "E:/Documents/RPGMakerGame"` writes the translation from `.txt` files of the `translation` folder to RPG Maker files in the `output` folder.
+`rvpacker-txt-rs write -i "C:/Game"` writes the translation from `.txt` files of the `translation` folder to RPG Maker files in the `output` folder.
 
 ## License
 
