@@ -481,7 +481,7 @@ fn main() -> Result<()> {
                 .write(
                     &source_path,
                     translation_path,
-                    &output_dir,
+                    &output_dir.join("output"),
                     engine_type,
                 )?;
         }
