@@ -1,14 +1,14 @@
 [package]
 name = "rvpacker-txt-rs"
-version = "9.0.0"
+version = "9.0.2"
 edition = "2021"
 
 [dependencies]
 sys-locale = "0.3.2"
-clap = { version = "4.5.41", features = ["wrap_help", "cargo", "derive"] }
+clap = { version = "4.5.42", features = ["wrap_help", "cargo", "derive"] }
 color-print = "0.3.7"
 rpgmad-lib = "3.0.0"
-rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "9.0.0" }
+rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "9.0.2" }
 encoding_rs = "0.8.35"
 asset_decrypter = { package = "rpgm-asset-decrypter-lib", version = "2.1.0" }
 serde_json = { version = "1.0.141", features = ["preserve_order"] }
