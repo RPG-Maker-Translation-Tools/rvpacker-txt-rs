@@ -1,6 +1,6 @@
 [package]
 name = "rvpacker-txt-rs"
-version = "9.0.4"
+version = "9.0.5"
 edition = "2021"
 
 [dependencies]
@@ -17,5 +17,5 @@ anyhow = "1.0.100"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 strum_macros = "0.27.2"
-serde = "1.0.227"
+serde = "1.0.228"
 clap-verbosity-flag = { version = "3.0.4", default-features = false, features = ["tracing"] }
