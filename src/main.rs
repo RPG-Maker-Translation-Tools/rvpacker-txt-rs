@@ -401,6 +401,7 @@ fn main() -> Result<()> {
                     duplicate_mode,
                 };
 
+                create_dir_all(translation_path)?;
                 write(metadata_file_path, to_string(&metadata)?)?;
             } else if ignore && !ignore_file_path.exists() {
                 bail!(
