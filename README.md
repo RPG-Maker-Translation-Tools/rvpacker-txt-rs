@@ -10,8 +10,13 @@ This tool inherits its name from the original `rvpacker` tool, which was created
 
 The same deprecated tool, written in Ruby, can be found in [rvpacker-txt repository](https://github.com/savannstm/rvpacker-txt).
 
-There's [a GUI](https://github.com/savannstm/rpgmtranslate), that allows you comfortably edit files.
-An underlying library for this CLI can be found [here](https://github.com/savannstm/rvpacker-txt-rs-lib).
+There's [a GUI](https://github.com/rpg-maker-translation-tools/rpgmtranslate), that allows you comfortably edit files.
+
+This CLI is written on top of [rvpacker-txt-rs-lib library](https://github.com/rpg-maker-translation-tools/rvpacker-txt-rs-lib).
+
+We also have blazingly fast [asset](https://github.com/rpg-maker-translation-tools/rpgm-asset-decrypter-rs) and [archive decrypter](https://github.com/rpg-maker-translation-tools/rpgm-archive-decrypter) CLIs, you can use those to decrypt/encrypt assets and archives.
+
+If you're not a fan of CLIs, you can use [a GUI](https://github.com/rpg-maker-translation-tools/rpgmdec) that combines asset and archives decrypters, it's very fast and light.
 
 ## The format of output files
 
@@ -37,4 +42,4 @@ Examples:
 
 ## License
 
-The repository is licensed under [WTFPL](http://www.wtfpl.net/).
+Project is licensed under WTFPL.
