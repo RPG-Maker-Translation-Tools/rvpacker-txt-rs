@@ -37,6 +37,18 @@
 
 `rvpacker-txt-rs write -i "C:/Game"` запишет перевод из `.txt` файлов папки `translation` в файлы RPG Maker в папке `output`.
 
+## Поддержка
+
+[Я](https://github.com/savannstm), ответственный за этот проект - бедный студент колледжа из Восточной Европы.
+
+Если вы можете, пожалуйста, рассмотрите возможность поддержать нас через:
+
+-   [Ko-fi](https://ko-fi.com/savannstm)
+-   [Patreon](https://www.patreon.com/cw/savannstm)
+-   [Boosty](https://boosty.to/mcdeimos)
+
+Даже если вы не поддержите, всё нормально. Мы продолжим заниматься тем же, что делаем сейчас.
+
 ## Лицензия
 
 Проект лицензирован под WTFPL.
