@@ -1,6 +1,6 @@
 [package]
 name = "rvpacker-txt-rs"
-version = "10.0.0"
+version = "11.0.0"
 edition = "2024"
 
 [dependencies]
@@ -8,13 +8,13 @@ sys-locale = "0.3.2"
 clap = { version = "4.5.53", features = ["wrap_help", "cargo", "derive"] }
 color-print = "0.3.7"
 rpgmad-lib = "4.0.0"
-rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "10.0.0" }
+rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "11.0.0" }
 encoding_rs = "0.8.35"
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
-getset = "0.1.6"
 anyhow = "1.0.100"
 tracing = "0.1.43"
 tracing-subscriber = "0.3.22"
 strum_macros = "0.27.2"
 serde = "1.0.228"
 clap-verbosity-flag = { version = "3.0.4", default-features = false, features = ["tracing"] }
+strum = { version = "0.27.2", features = ["strum_macros"] }
