@@ -145,7 +145,7 @@ struct Metadata {
     disable_custom_processing: bool,
     trim: bool,
     duplicate_mode: DuplicateMode,
-    hashes: Vec<u128>,
+    hashes: Option<Vec<u128>>,
 }
 
 /// This tool allows to parse RPG Maker XP/VX/VXAce/MV/MZ games text to `.txt` files and write them back to their initial form. The program uses `original` or `data` directories for source files, and `translation` directory to operate with translation files. It will also decrypt any `.rgss` archive if it's present.
@@ -479,7 +479,7 @@ impl<'a> Processor<'a> {
         let game_title = self.get_game_title()?;
         let game_type = get_game_type(&game_title, disable_custom_processing);
 
-        let mut hashes = Vec::new();
+        let mut hashes = None;
 
         if read_mode.is_append()
             && let Some(metadata) = parse_metadata(&self.metadata_file_path)?
@@ -492,6 +492,8 @@ impl<'a> Processor<'a> {
                 hashes,
             } = metadata;
         }
+
+        let hashes = hashes.unwrap_or_default();
 
         if read_mode.is_force() && !silent {
             let start = Instant::now();
@@ -561,7 +563,7 @@ impl<'a> Processor<'a> {
             disable_custom_processing,
             trim,
             duplicate_mode,
-            hashes: reader.hashes(),
+            hashes: Some(reader.hashes()),
         };
 
         create_dir_all(&self.translation_path)?;
