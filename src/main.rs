@@ -7,23 +7,25 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{
-    ArgAction, Args, Parser, Subcommand,
+    ArgAction, Args, Parser, Subcommand, ValueEnum,
     builder::{PossibleValuesParser, TypedValueParser},
     crate_version, value_parser,
 };
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use rpgmad_lib::Decrypter;
 use rvpacker_lib::{
-    BaseFlags, PurgerBuilder, RPGMFileType, RVPACKER_IGNORE_FILE,
-    RVPACKER_METADATA_FILE, ReaderBuilder, WriterBuilder, get_ini_title,
-    get_system_title, json,
+    BaseFlags, Mode, ProcessedData, PurgerBuilder, RPGMFileType,
+    RVPACKER_IGNORE_FILE, RVPACKER_METADATA_FILE, ReaderBuilder, WriterBuilder,
+    core::parse_ignore,
+    generic, get_ini_title, get_system_title, json,
     types::{DuplicateMode, EngineType, FileFlags, GameType, ReadMode},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string};
 use std::{
-    fs::{create_dir_all, read, read_to_string, write},
+    fs::{create_dir_all, read, read_dir, read_to_string, write},
     io::stdin,
+    mem::take,
     path::{Path, PathBuf},
     process::exit,
     str::FromStr,
@@ -120,6 +122,12 @@ impl FromStr for SkipEvents {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GenericType {
+    JSON,
+    Marshal,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FFlags(pub FileFlags);
 
@@ -146,56 +154,6 @@ struct Metadata {
     trim: bool,
     duplicate_mode: DuplicateMode,
     hashes: Option<Vec<u128>>,
-}
-
-/// This tool allows to parse RPG Maker XP/VX/VXAce/MV/MZ games text to `.txt` files and write them back to their initial form. The program uses `original` or `data` directories for source files, and `translation` directory to operate with translation files. It will also decrypt any `.rgss` archive if it's present.
-#[derive(Parser, Debug)]
-#[command(version = crate_version!(), next_line_help = true, term_width = 120)]
-struct Cli {
-    /// Input directory, containing game files
-    #[arg(short, long, global = true, default_value = "./", value_name = "INPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 1)]
-    input_dir: PathBuf,
-
-    /// Output directory to output files to
-    #[arg(short, long, global = true, value_name = "OUTPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 2)]
-    output_dir: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Command,
-
-    #[command(flatten)]
-    verbosity: Verbosity<InfoLevel>,
-}
-
-#[derive(Debug, Subcommand, EnumIs)]
-enum Command {
-    /// Parses game files to `.txt` format, and decrypts any `.rgss` archive if it's present
-    Read(ReadArgs),
-
-    /// Writes translated game files to the output directory
-    Write(SharedArgs),
-
-    /// Purges lines without translation from translation files
-    Purge(PurgeArgs),
-
-    /// Provides the commands for JSON generation and writing
-    Json {
-        #[command(subcommand)]
-        subcommand: JsonSubcommand,
-    },
-}
-
-#[derive(Debug, Args)]
-struct ReadArgs {
-    #[arg(short = 'S', long, hide = true, action = ArgAction::SetTrue)]
-    silent: bool,
-
-    /// Ignore entries from `.rvpacker-ignore` file.
-    #[arg(short = 'I', long, action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
-    ignore: bool,
-
-    #[command(flatten)]
-    shared: SharedArgs,
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +238,22 @@ struct SharedArgs {
 }
 
 #[derive(Debug, Args)]
+struct ReadArgs {
+    #[arg(short = 'S', long, hide = true, action = ArgAction::SetTrue)]
+    silent: bool,
+
+    /// Ignore entries from `.rvpacker-ignore` file.
+    #[arg(short = 'I', long, action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
+    ignore: bool,
+
+    #[arg(long, alias = "so", action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
+    skip_obsolete: bool,
+
+    #[command(flatten)]
+    shared: SharedArgs,
+}
+
+#[derive(Debug, Args)]
 struct PurgeArgs {
     /// Creates an ignore file from purged lines, to prevent their further appearance when reading with `--mode append`
     #[arg(short, long, action = ArgAction::SetTrue, display_order = 23)]
@@ -287,6 +261,21 @@ struct PurgeArgs {
 
     #[command(flatten)]
     shared: SharedArgs,
+}
+
+#[derive(Debug, Args)]
+struct GenericArgs {
+    /// Removes the leading and trailing whitespace from extracted strings. Don't use this option unless you know that trimming the text won't cause any incorrect behavior
+    #[arg(short, long, action = ArgAction::SetTrue, display_order = 6)]
+    trim: bool,
+
+    /// If you parsing text from a Japanese game, that contains symbols like 「」, which are just the Japanese quotation marks, it automatically replaces these symbols by their western equivalents (in this case, '').
+    /// Will be automatically set if it was used in read
+    #[arg(short = 'R', long, action = ArgAction::SetTrue, display_order = 5)]
+    romanize: bool,
+
+    #[arg(short, long, value_parser = value_parser!(GenericType), required = true)]
+    generic_type: GenericType,
 }
 
 #[derive(Debug, Subcommand)]
@@ -299,13 +288,92 @@ enum JsonSubcommand {
             alias = "mode",
             default_value = "default",
             value_name = "MODE",
-            value_parser = PossibleValuesParser::new(ReadMode::VARIANTS)
+            value_parser = PossibleValuesParser::new(["default", "append", "force", "force-append"]).map(|s| ReadMode::from_str(&s).unwrap())
         )]
         read_mode: ReadMode,
     },
 
     /// Writes JSON representations of older engines' files from `json` directory back to original files
     Write,
+}
+
+#[derive(Debug, Subcommand, EnumIs)]
+enum GenericSubcommand {
+    Read {
+        #[arg(
+            short,
+            long,
+            alias = "mode",
+            default_value = "default",
+            value_name = "MODE",
+            value_parser = PossibleValuesParser::new(["default", "append", "force", "force-append"]).map(|s| ReadMode::from_str(&s).unwrap())
+        )]
+        read_mode: ReadMode,
+
+        /// Ignore entries from `.rvpacker-ignore` file.
+        #[arg(short = 'I', long, action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
+        ignore: bool,
+
+        #[command(flatten)]
+        generic_args: GenericArgs,
+    },
+
+    Write {
+        #[command(flatten)]
+        generic_args: GenericArgs,
+    },
+
+    Purge {
+        /// Creates an ignore file from purged lines, to prevent their further appearance when reading with `--mode append`
+        #[arg(short, long, action = ArgAction::SetTrue, display_order = 23)]
+        create_ignore: bool,
+
+        #[command(flatten)]
+        generic_args: GenericArgs,
+    },
+}
+
+#[derive(Debug, Subcommand, EnumIs)]
+enum Command {
+    /// Parses game files to `.txt` format, and decrypts any `.rgss` archive if it's present
+    Read(ReadArgs),
+
+    /// Writes translated game files to the output directory
+    Write(SharedArgs),
+
+    /// Purges lines without translation from translation files
+    Purge(PurgeArgs),
+
+    /// Provides `read`, `write` and `purge` subcommands for processing generic JSON/Marshal files
+    Generic {
+        #[command(subcommand)]
+        subcommand: GenericSubcommand,
+    },
+
+    /// Provides the commands for JSON generation and writing
+    Json {
+        #[command(subcommand)]
+        subcommand: JsonSubcommand,
+    },
+}
+
+/// This tool allows to parse RPG Maker XP/VX/VXAce/MV/MZ games text to `.txt` files and write them back to their initial form. The program uses `data` or `Data` directories for source files, and `translation` directory to operate with translation files. It will also decrypt any `.rgss` archive if it's present.
+#[derive(Parser, Debug)]
+#[command(version = crate_version!(), next_line_help = true, term_width = 120)]
+struct Cli {
+    /// Input directory, containing game files
+    #[arg(short, long, global = true, default_value = "./", value_name = "INPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 1)]
+    input_dir: PathBuf,
+
+    /// Output directory to output files to
+    #[arg(short, long, global = true, value_name = "OUTPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 2)]
+    output_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+
+    #[command(flatten)]
+    verbosity: Verbosity<InfoLevel>,
 }
 
 fn parse_metadata(metadata_file_path: &Path) -> Result<Option<Metadata>> {
@@ -360,75 +428,87 @@ impl<'a> Processor<'a> {
         cli: &mut Cli,
         start_time: &'a mut Instant,
     ) -> Result<Self, anyhow::Error> {
-        let input_dir = std::mem::take(&mut cli.input_dir);
+        let mut input_dir = take(&mut cli.input_dir);
 
         if !input_dir.exists() {
             bail!("Input directory does not exist.");
         }
 
-        let output_dir = std::mem::take(&mut cli.output_dir)
-            .unwrap_or_else(|| input_dir.clone());
+        let output_dir =
+            take(&mut cli.output_dir).unwrap_or_else(|| input_dir.clone());
 
         if !output_dir.exists() {
             bail!("Output directory does not exist.");
         }
 
-        let source_path = ["original", "data", "Data"]
-            .into_iter()
-            .find_map(|dir| {
-                let path = input_dir.join(dir);
+        let source_path = if !cli.command.is_generic() {
+            ["data", "Data"]
+                .into_iter()
+                .find_map(|dir| {
+                    let path = input_dir.join(dir);
 
-                if path.exists() {
-                    return Some(path);
-                }
+                    if path.exists() {
+                        return Some(path);
+                    }
 
-                None
-            })
-            .context(
-                "Could not found `original` or `data`/`Data` directory.",
-            )?;
+                    None
+                })
+                .context("Could not found `data`/`Data` directory.")?
+        } else {
+            take(&mut input_dir)
+        };
 
         let translation_path = output_dir.join("translation");
         let metadata_file_path = translation_path.join(RVPACKER_METADATA_FILE);
         let ignore_file_path = translation_path.join(RVPACKER_IGNORE_FILE);
 
-        let type_paths = [
-            (EngineType::New, source_path.join("System.json"), None),
-            (
-                EngineType::VXAce,
-                source_path.join("System.rvdata2"),
-                Some(input_dir.join("Game.rgss3a")),
-            ),
-            (
-                EngineType::VX,
-                source_path.join("System.rvdata"),
-                Some(input_dir.join("Game.rgss2a")),
-            ),
-            (
-                EngineType::XP,
-                source_path.join("System.rxdata"),
-                Some(input_dir.join("Game.rgssad")),
-            ),
-        ];
+        let (engine_type, system_file_path, archive_path, ini_file_path) =
+            if !cli.command.is_generic() {
+                let type_paths = [
+                    (EngineType::New, source_path.join("System.json"), None),
+                    (
+                        EngineType::VXAce,
+                        source_path.join("System.rvdata2"),
+                        Some(input_dir.join("Game.rgss3a")),
+                    ),
+                    (
+                        EngineType::VX,
+                        source_path.join("System.rvdata"),
+                        Some(input_dir.join("Game.rgss2a")),
+                    ),
+                    (
+                        EngineType::XP,
+                        source_path.join("System.rxdata"),
+                        Some(input_dir.join("Game.rgssad")),
+                    ),
+                ];
 
-        let Some((engine_type, system_file_path, archive_path)) = type_paths
-            .into_iter()
-            .find_map(|(engine_type, system_file_path, archive_path)| {
-                if !system_file_path.exists()
-                    && archive_path.as_ref().is_none_or(|path| !path.exists())
-                {
-                    return None;
-                }
+                let Some((engine_type, system_file_path, archive_path)) =
+                    type_paths.into_iter().find_map(
+                        |(engine_type, system_file_path, archive_path)| {
+                            if !system_file_path.exists()
+                                && archive_path
+                                    .as_ref()
+                                    .is_none_or(|path| !path.exists())
+                            {
+                                return None;
+                            }
 
-                Some((engine_type, system_file_path, archive_path))
-            })
-        else {
-            bail!(
-                "Couldn't determine game engine. Check the existence of `System` file inside `original` or `data`/`Data` directory, or `.rgss` archive."
-            );
-        };
+                            Some((engine_type, system_file_path, archive_path))
+                        },
+                    )
+                else {
+                    bail!(
+                        "Couldn't determine game engine. Check the existence of `System` file inside `data`/`Data` directory, or `.rgss` archive."
+                    );
+                };
 
-        let ini_file_path = input_dir.join("Game.ini");
+                let ini_file_path = input_dir.join("Game.ini");
+
+                (engine_type, system_file_path, archive_path, ini_file_path)
+            } else {
+                Default::default()
+            };
 
         Ok(Self {
             engine_type,
@@ -475,6 +555,7 @@ impl<'a> Processor<'a> {
         let file_flags = FileFlags::all() & !skip_files.0;
         let silent = args.silent;
         let ignore = args.ignore;
+        let skip_obsolete = args.skip_obsolete;
 
         let game_title = self.get_game_title()?;
         let game_type = get_game_type(&game_title, disable_custom_processing);
@@ -539,6 +620,7 @@ impl<'a> Processor<'a> {
         flags.set(BaseFlags::Romanize, romanize);
         flags.set(BaseFlags::Ignore, ignore);
         flags.set(BaseFlags::Trim, trim);
+        flags.set(BaseFlags::SkipObsolete, skip_obsolete);
 
         let mut reader = ReaderBuilder::new()
             .with_files(file_flags)
@@ -654,7 +736,6 @@ impl<'a> Processor<'a> {
         }
 
         let game_title = self.get_game_title()?;
-
         let game_type = get_game_type(&game_title, disable_custom_processing);
 
         let mut flags: BaseFlags = BaseFlags::empty();
@@ -675,6 +756,150 @@ impl<'a> Processor<'a> {
                 &self.translation_path,
                 self.engine_type,
             )?;
+
+        Ok(())
+    }
+
+    pub fn execute_generic(
+        &self,
+        subcommand: &GenericSubcommand,
+    ) -> Result<(), anyhow::Error> {
+        use generic::GenericBase;
+
+        let (mut base, read_mode, generic_type) = match subcommand {
+            GenericSubcommand::Read {
+                read_mode,
+                ignore,
+                generic_args,
+            } => {
+                let mut base = GenericBase::new(Mode::Read(*read_mode));
+                base.flags.set(BaseFlags::Romanize, generic_args.romanize);
+                base.flags.set(BaseFlags::Trim, generic_args.trim);
+                base.flags.set(BaseFlags::Ignore, *ignore);
+
+                (base, *read_mode, generic_args.generic_type)
+            }
+
+            GenericSubcommand::Write { generic_args } => {
+                let mut base = GenericBase::new(Mode::Write);
+                base.flags.set(BaseFlags::Romanize, generic_args.romanize);
+                base.flags.set(BaseFlags::Trim, generic_args.trim);
+
+                (base, ReadMode::Default(false), generic_args.generic_type)
+            }
+
+            GenericSubcommand::Purge {
+                create_ignore,
+                generic_args,
+            } => {
+                let mut base = GenericBase::new(Mode::Purge);
+                base.flags.set(BaseFlags::CreateIgnore, *create_ignore);
+
+                (base, ReadMode::Default(false), generic_args.generic_type)
+            }
+        };
+
+        let mut ignore_file_path = PathBuf::new();
+
+        if base
+            .flags
+            .intersects(BaseFlags::CreateIgnore | BaseFlags::Ignore)
+        {
+            ignore_file_path = self.translation_path.join(RVPACKER_IGNORE_FILE);
+
+            let ignore_file_content = read_to_string(&ignore_file_path);
+
+            match ignore_file_content {
+                Ok(content) => {
+                    base.ignore_map = parse_ignore(
+                        &content,
+                        DuplicateMode::Remove,
+                        base.mode.is_read(),
+                    );
+                }
+
+                err if base.flags.contains(BaseFlags::Ignore) => {
+                    err?;
+                }
+
+                _ => {}
+            }
+        }
+
+        if subcommand.is_read() {
+            create_dir_all(&self.translation_path)?;
+        }
+
+        for file in read_dir(&self.input_dir)?.flatten() {
+            let path = file.path();
+            let filename = file.file_name().into_string().unwrap();
+
+            let translation_path = self.translation_path.join(
+                Path::new(&filename.to_lowercase()).with_extension("txt"),
+            );
+            let mut translation = None;
+
+            if read_mode.is_append() {
+                translation = Some(read_to_string(&translation_path)?);
+            }
+
+            let processed = match generic_type {
+                GenericType::JSON => {
+                    println!("{}", path.display());
+                    let content = read_to_string(&path)?;
+
+                    base.process_json(
+                        &content,
+                        &filename,
+                        translation.as_deref(),
+                    )?
+                }
+                GenericType::Marshal => {
+                    let content = read(&path)?;
+
+                    base.process_marshal(
+                        &content,
+                        &filename,
+                        translation.as_deref(),
+                    )?
+                }
+            };
+
+            match processed {
+                ProcessedData::RPGMData(d) => {
+                    write(path, d)?;
+                }
+                ProcessedData::TranslationData(d) => {
+                    write(translation_path, d)?;
+                }
+            }
+        }
+
+        if base.flags.contains(BaseFlags::CreateIgnore) {
+            use std::fmt::Write;
+
+            let contents: String = take(&mut base.ignore_map).into_iter().fold(
+                String::new(),
+                |mut output, (file, lines)| {
+                    let _ = write!(
+                        output,
+                        "{}\n{}",
+                        file,
+                        lines
+                            .into_iter()
+                            .map(|mut x| {
+                                x.push('\n');
+                                x
+                            })
+                            .collect::<String>()
+                    );
+
+                    output
+                },
+            );
+
+            write(&ignore_file_path, contents)?;
+        }
 
         Ok(())
     }
@@ -721,6 +946,9 @@ fn main() -> Result<()> {
         Command::Read(args) => processor.execute_read(args)?,
         Command::Write(args) => processor.execute_write(args)?,
         Command::Purge(args) => processor.execute_purge(args)?,
+        Command::Generic { subcommand } => {
+            processor.execute_generic(&subcommand)?
+        }
         Command::Json { subcommand } => processor.execute_json(&subcommand)?,
     }
 
