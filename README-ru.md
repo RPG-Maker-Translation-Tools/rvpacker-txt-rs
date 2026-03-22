@@ -8,13 +8,13 @@
 
 Устаревший инструмент с тем же функционалом, написанный на Ruby, можно найти в [репозитории rvpacker-txt](https://github.com/savannstm/rvpacker-txt).
 
-Также разрабатывается [графический интерфейс](https://github.com/rpg-maker-translation-tools/rpgmtranslate), позволяющий удобно переводить игры.
+Также разрабатывается [графический интерфейс](https://github.com/RPG-Maker-Translation-Tools/rpgmtranslate-qt), позволяющий удобно переводить игры.
 
-Библиотека, лежащая в основе этого интерфейса, может быть найдена [здесь](https://github.com/rpg-maker-translation-tools/rvpacker-txt-rs-lib).
+Библиотека, лежащая в основе этого интерфейса, может быть найдена [здесь](https://github.com/RPG-Maker-Translation-Tools/rvpacker-txt-rs-lib).
 
-У нас также есть невероятно быстрые дешифраторы [ассетов](https://github.com/rpg-maker-translation-tools/rpgm-asset-decrypter-rs) и [архивов](https://github.com/rpg-maker-translation-tools/rpgm-archive-decrypter) в виде инструментов для командной строки, вы можете использовать их для дешифрования/шифрования ассетов и архивов.
+У нас также есть невероятно быстрые дешифраторы [ассетов](https://github.com/RPG-Maker-Translation-Tools/rpgm-asset-decrypter-rs) и [архивов](https://github.com/RPG-Maker-Translation-Tools/rpgm-archive-decrypter) в виде инструментов для командной строки, вы можете использовать их для дешифрования/шифрования ассетов и архивов.
 
-Если вы не фанат командной строки, можете воспользоваться [графическим интерфейсом](https://github.com/rpg-maker-translation-tools/rpgmdec) который объединяет дешифраторы ассетов и архивов, он очень быстрый и лёгкий.
+Если вы не фанат командной строки, можете воспользоваться [графическим интерфейсом](https://github.com/RPG-Maker-Translation-Tools/rpgmdec) который объединяет дешифраторы ассетов и архивов, он очень быстрый и лёгкий.
 
 ## Формат выходных файлов
 
@@ -43,9 +43,9 @@
 
 Если вы можете, пожалуйста, рассмотрите возможность поддержать нас через:
 
--   [Ko-fi](https://ko-fi.com/savannstm)
--   [Patreon](https://www.patreon.com/cw/savannstm)
--   [Boosty](https://boosty.to/mcdeimos)
+- [Ko-fi](https://ko-fi.com/savannstm)
+- [Patreon](https://www.patreon.com/cw/savannstm)
+- [Boosty](https://boosty.to/mcdeimos)
 
 Даже если вы не поддержите, всё нормально. Мы продолжим заниматься тем же, что делаем сейчас.
 
