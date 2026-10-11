@@ -3,6 +3,7 @@ name = "rvpacker-txt-rs"
 version = "18.0.0"
 edition = "2024"
 rust-version = "1.88.0"
+license = "WTFPL"
 
 [dependencies]
 anyhow = "1.0.104"

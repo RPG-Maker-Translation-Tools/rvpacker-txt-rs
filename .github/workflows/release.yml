@@ -60,10 +60,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download -R upx/upx -p 'upx-*-amd64_linux.tar.xz' -O upx.tar.xz
-          mkdir upx
-          tar -xJf upx.tar.xz -C upx --strip-components=1
-          echo "$PWD/upx" >> "$GITHUB_PATH"
+          # Outside the checkout: cargo-about scans the crate directory and would pick up UPX's GPL `COPYING`.
+          gh release download -R upx/upx -p 'upx-*-amd64_linux.tar.xz' -O "$RUNNER_TEMP/upx.tar.xz"
+          mkdir "$RUNNER_TEMP/upx"
+          tar -xJf "$RUNNER_TEMP/upx.tar.xz" -C "$RUNNER_TEMP/upx" --strip-components=1
+          echo "$RUNNER_TEMP/upx" >> "$GITHUB_PATH"
 
       - name: Install UPX (Windows)
         if: runner.os == 'Windows'
@@ -82,7 +83,8 @@ jobs:
         run: |
           gh release download -R EmbarkStudios/cargo-about -p 'cargo-about-*-${{ matrix.about }}.tar.gz' -O about.tar.gz
           mkdir "$RUNNER_TEMP/about"
-          tar -xzf about.tar.gz -C "$RUNNER_TEMP/about" --strip-components=1
+          # GNU tar on Windows can't take `C:\` paths for -C, cygpath only exists there.
+          tar -xzf about.tar.gz -C "$(cygpath -u "$RUNNER_TEMP/about" 2>/dev/null || echo "$RUNNER_TEMP/about")" --strip-components=1
           echo "$RUNNER_TEMP/about" >> "$GITHUB_PATH"
 
       - name: Build
