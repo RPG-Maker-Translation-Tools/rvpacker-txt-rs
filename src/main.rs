@@ -1,9 +1,4 @@
-#![warn(clippy::all, clippy::pedantic)]
-#![allow(clippy::needless_doctest_main)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::cast_possible_wrap)]
-#![allow(clippy::cast_sign_loss)]
-#![allow(clippy::deref_addrof)]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{
@@ -30,15 +25,46 @@ use rvpacker_lib::{
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{from_str, to_string};
 use std::{
+    borrow::Cow,
     fs::{create_dir_all, read, read_dir, read_to_string, write},
     io::stdin,
     mem::take,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::exit,
     str::FromStr,
     time::Instant,
 };
 use strum::VariantNames;
+
+/// Parses `0,1,5-8` into the indices it spells out. Empty parts are ignored.
+fn parse_indices(s: &str) -> Result<Vec<u16>, String> {
+    let mut indices = Vec::new();
+
+    for part in s.split(',').map(str::trim).filter(|part| !part.is_empty()) {
+        if let Some((a, b)) = part.split_once('-') {
+            let (a, b) = (a.trim(), b.trim());
+            let start = a
+                .parse::<u16>()
+                .map_err(|e| format!("Invalid start of range `{a}`: {e}"))?;
+            let end = b
+                .parse::<u16>()
+                .map_err(|e| format!("Invalid end of range `{b}`: {e}"))?;
+
+            if start > end {
+                return Err(format!("Range `{part}` is reversed (start > end)"));
+            }
+
+            indices.extend(start..=end);
+        } else {
+            indices.push(
+                part.parse::<u16>()
+                    .map_err(|e| format!("Invalid integer `{part}`: {e}"))?,
+            );
+        }
+    }
+
+    Ok(indices)
+}
 
 #[derive(Clone, Debug)]
 pub struct SkipMaps(pub Vec<u16>);
@@ -47,33 +73,7 @@ impl FromStr for SkipMaps {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut indices = Vec::new();
-
-        for part in s.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            if let Some((a, b)) = part.split_once('-') {
-                let start = a
-                    .parse::<u16>()
-                    .map_err(|e| format!("Invalid start of range `{a}`: {e}"))?;
-                let end = b
-                    .parse::<u16>()
-                    .map_err(|e| format!("Invalid end of range `{b}`: {e}"))?;
-
-                if start > end {
-                    return Err(format!("Range `{part}` is reversed (start > end)"));
-                }
-
-                for v in start..=end {
-                    indices.push(v);
-                }
-            } else {
-                let v = part
-                    .parse::<u16>()
-                    .map_err(|e| format!("Invalid integer `{part}`: {e}"))?;
-                indices.push(v);
-            }
-        }
-
-        Ok(SkipMaps(indices))
+        parse_indices(s).map(SkipMaps)
     }
 }
 
@@ -91,38 +91,12 @@ impl FromStr for SkipEvents {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut result = Vec::new();
 
-        for section in s.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-            let mut indices = Vec::new();
-
-            let Some((file, parts)) = section.split_once(':') else {
-                return Err(String::new());
+        for section in s.split(';').map(str::trim).filter(|section| !section.is_empty()) {
+            let Some((file, indices)) = section.split_once(':') else {
+                return Err(format!("Invalid section `{section}`, expected `file:0,1,..`"));
             };
 
-            for part in parts.split(',') {
-                if let Some((a, b)) = part.split_once('-') {
-                    let start = a
-                        .parse::<u16>()
-                        .map_err(|e| format!("Invalid start of range `{a}`: {e}"))?;
-                    let end = b
-                        .parse::<u16>()
-                        .map_err(|e| format!("Invalid end of range `{b}`: {e}"))?;
-
-                    if start > end {
-                        return Err(format!("Range `{part}` is reversed (start > end)"));
-                    }
-
-                    for v in start..=end {
-                        indices.push(v);
-                    }
-                } else {
-                    let v = part
-                        .parse::<u16>()
-                        .map_err(|e| format!("Invalid integer `{part}`: {e}"))?;
-                    indices.push(v);
-                }
-            }
-
-            result.push((file.to_string(), indices));
+            result.push((file.trim().to_string(), parse_indices(indices)?));
         }
 
         Ok(SkipEvents(result))
@@ -139,7 +113,15 @@ impl FromStr for SkipEvents {
 /// `.txt` output uses (`actors.txt`, `skills.txt`, ...).
 fn resolve_file_type(name: &str, engine_type: EngineType) -> Option<RPGMFileType> {
     if engine_type != EngineType::RM2K {
-        return Some(RPGMFileType::from_filename(name));
+        let file_type = RPGMFileType::from_filename(name);
+
+        // `from_filename` maps anything it doesn't know to `Invalid`, and maps have no events to skip.
+        if matches!(file_type, RPGMFileType::Invalid | RPGMFileType::Map) {
+            eprintln!("warning: `{name}` is not a file kind that has events to skip; ignoring it");
+            return None;
+        }
+
+        return Some(file_type);
     }
 
     Some(match name.to_ascii_lowercase().as_str() {
@@ -250,13 +232,15 @@ struct Metadata {
     /// so it round-trips through [`Encoding::for_label`] without a custom
     /// `Serialize`/`Deserialize` impl for [`TextEncoding`].
     ///
-    /// Kept separate from [`Metadata::write_encoding`] deliberately - the
-    /// source game's codepage and the codepage a translation should be
-    /// written back in are almost never the same value. `read_encoding`
-    /// matters on write too, not just read: recovering a source line to look
+    /// Matters on write too, not just read: recovering a source line to look
     /// it up in the translation file requires decoding it the same way it
     /// was decoded when the `.txt` was produced.
     read_encoding: Option<String>,
+    /// Whether `read` recorded event headers. `append` and `purge` regenerate the translation files from the game
+    /// and drop whatever headers they aren't told to write, so this has to be remembered like the format settings.
+    /// Absent in metadata written before it existed, which means off.
+    #[serde(default)]
+    map_events: bool,
     #[serde(serialize_with = "serialize_sorted_hashes")]
     hashes: Option<HashMap<String, u64>>,
 }
@@ -312,23 +296,7 @@ fn apply_format_overrides(
 }
 
 #[derive(Args, Debug)]
-#[allow(clippy::struct_excessive_bools)]
 struct SharedArgs {
-    /// Defines how to read files.
-    /// `default` - If encounters existing translation files, aborts read.
-    /// `append` - Appends any new text from the game to the translation files, if the text is not already present. Unused lines are removed from translation files, and the lines order is sorted.
-    /// `force` - Force rewrites existing translation files
-    #[arg(
-        short,
-        long,
-        alias = "mode",
-        default_value = "default",
-        value_name = "MODE",
-        display_order = 3,
-        value_parser = PossibleValuesParser::new(["default", "append", "force", "force-append"]).map(|s| Mode::from_str(&s).unwrap())
-    )]
-    read_mode: Mode,
-
     /// Skips processing specified files, separated by comma. `plugins` can be used interchangeably with `scripts`
     #[arg(
         short,
@@ -362,35 +330,51 @@ struct SharedArgs {
     )]
     skip_events: SkipEvents,
 
-    /// Parse information about map events for the map files.
-    /// This will give you more info about where the text of the event happens.
-    #[arg(short, long, alias = "me", action = ArgAction::SetTrue)]
-    map_events: bool,
-
-    /// Controls how to handle duplicates in text.
-    /// A value already recorded in `.rvpacker-metadata` takes precedence over this.
+    /// Controls how to handle duplicates in text. Defaults to `allow`.
+    /// Left unset, the value recorded in `.rvpacker-metadata` is used.
     #[arg(
         short,
         long,
         alias = "dup-mode",
-        default_value = "remove",
         display_order = 93,
         value_parser = PossibleValuesParser::new(DuplicateMode::VARIANTS).map(|s| DuplicateMode::from_str(&s).unwrap())
     )]
-    duplicate_mode: DuplicateMode,
+    duplicate_mode: Option<DuplicateMode>,
 }
 
 #[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct ReadArgs {
+    /// Defines how to read files.
+    /// `default` - If encounters existing translation files, aborts read.
+    /// `append` - Appends any new text from the game to the translation files, if the text is not already present. Unused lines are removed from translation files, and the lines order is sorted.
+    /// `force` - Force rewrites existing translation files
+    #[arg(
+        short,
+        long,
+        alias = "mode",
+        default_value = "default",
+        value_name = "MODE",
+        display_order = 3,
+        value_parser = PossibleValuesParser::new(["default", "append", "force", "force-append"]).map(|s| Mode::from_str(&s).unwrap())
+    )]
+    read_mode: Mode,
+
     #[arg(short = 'S', long, hide = true, action = ArgAction::SetTrue)]
     silent: bool,
 
     /// Ignore entries from `.rvpacker-ignore` file.
-    #[arg(short = 'I', long, action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
+    #[arg(short = 'I', long, action = ArgAction::SetTrue)]
     ignore: bool,
 
-    #[arg(long, alias = "so", action = ArgAction::SetTrue, requires_if("append", "read_mode"), requires_if("force-append", "read_mode"))]
+    #[arg(long, alias = "so", action = ArgAction::SetTrue)]
     skip_obsolete: bool,
+
+    /// Parse information about map events for the map files.
+    /// This will give you more info about where the text of the event happens.
+    /// Recorded in `.rvpacker-metadata`, so `append` and `purge` keep the event headers without it.
+    #[arg(short, long, alias = "me", action = ArgAction::SetTrue)]
+    map_events: bool,
 
     /// Decodes `Game.ini`'s (or, if absent, `RPG_RT.ini`'s) title with the
     /// given encoding and prints it, without reading anything else. Use this
@@ -416,6 +400,11 @@ struct PurgeArgs {
     #[arg(short, long, action = ArgAction::SetTrue, display_order = 23)]
     create_ignore: bool,
 
+    /// Keeps the event headers of the map files. Not needed if `read` was run with `--map-events`: it's recorded in
+    /// `.rvpacker-metadata`.
+    #[arg(short, long, alias = "me", action = ArgAction::SetTrue)]
+    map_events: bool,
+
     #[command(flatten)]
     shared: SharedArgs,
 }
@@ -424,13 +413,14 @@ struct PurgeArgs {
 enum JsonSubcommand {
     /// Generates JSON representations of older engines' files in `json` directory
     Generate {
+        /// `default` - Skips files whose JSON already exists. `force` - Overwrites them
         #[arg(
             short,
             long,
             alias = "mode",
             default_value = "default",
             value_name = "MODE",
-            value_parser = PossibleValuesParser::new(["default", "append", "force", "force-append"]).map(|s| Mode::from_str(&s).unwrap())
+            value_parser = PossibleValuesParser::new(["default", "force"]).map(|s| Mode::from_str(&s).unwrap())
         )]
         read_mode: Mode,
     },
@@ -515,21 +505,20 @@ struct Cli {
     output_dir: Option<PathBuf>,
 
     /// Separator between the source and translation columns of a translation line.
-    /// Defaults to the library's own default (`<#>`). On `append`/`write`/`purge`, a
-    /// value already recorded in `.rvpacker-metadata` takes precedence over this.
+    /// Defaults to the library's own default (`<#>`). Left unset, the value recorded
+    /// in `.rvpacker-metadata` is used.
     #[arg(long, global = true, value_name = "SEPARATOR", display_order = 4)]
     line_separator: Option<String>,
 
     /// Marker that source/translation line breaks are normalized to in translation files.
-    /// Defaults to the library's own default (`\#`). On `append`/`write`/`purge`, a value
-    /// already recorded in `.rvpacker-metadata` takes precedence over this.
+    /// Defaults to the library's own default (`\#`). Left unset, the value recorded
+    /// in `.rvpacker-metadata` is used.
     #[arg(long, global = true, value_name = "BREAK", display_order = 5)]
     line_break: Option<String>,
 
     /// Prefix marking a line in translation files as a comment (`ID`, `NAME`, ignore
-    /// entries, etc). Defaults to the library's own default (`<!>`). On
-    /// `append`/`write`/`purge`, a value already recorded in `.rvpacker-metadata` takes
-    /// precedence over this.
+    /// entries, etc). Defaults to the library's own default (`<!>`). Left unset, the
+    /// value recorded in `.rvpacker-metadata` is used.
     #[arg(long, global = true, value_name = "PREFIX", display_order = 6)]
     comment_prefix: Option<String>,
 
@@ -549,9 +538,8 @@ struct Cli {
     /// Maker's editor in the original developer's own codepage - the same
     /// one the rest of the game's text uses.
     ///
-    /// Independent of `--write-encoding` - see its help text for why. On
-    /// `append`/`write`/`purge`, a value already recorded in
-    /// `.rvpacker-metadata` takes precedence over this.
+    /// Independent of `--write-encoding` - see its help text for why. Left unset,
+    /// the value recorded in `.rvpacker-metadata` is used.
     #[arg(long, global = true, value_name = "ENCODING", display_order = 7)]
     read_encoding: Option<TextEncoding>,
 
@@ -574,8 +562,8 @@ struct Cli {
     /// locale emulator) set to that same codepage. VX Ace is Unicode-native,
     /// so its UTF-8 default already works correctly without this.
     ///
-    /// Independent of `--read-encoding`. On `append`/`write`/`purge`, a value
-    /// already recorded in `.rvpacker-metadata` takes precedence over this.
+    /// Independent of `--read-encoding`. Never recorded in `.rvpacker-metadata`,
+    /// so pass it on every `write`.
     #[arg(long, global = true, value_name = "ENCODING", display_order = 8)]
     write_encoding: Option<TextEncoding>,
 
@@ -591,8 +579,9 @@ fn parse_metadata(metadata_file_path: &Path) -> Result<Option<Metadata>> {
         return Ok(None);
     }
 
-    let metadata_file_content = read_to_string(metadata_file_path)?;
-    let metadata = from_str(&metadata_file_content)?;
+    let metadata_file_content =
+        read_to_string(metadata_file_path).with_context(|| metadata_file_path.display().to_string())?;
+    let metadata = from_str(&metadata_file_content).with_context(|| metadata_file_path.display().to_string())?;
     Ok(Some(metadata))
 }
 
@@ -617,7 +606,6 @@ struct Session<'a> {
     comment_prefix: Option<String>,
     /// The codepage's canonical WHATWG label - see [`Metadata::read_encoding`].
     read_encoding: Option<String>,
-    /// See [`Metadata::write_encoding`].
     write_encoding: Option<String>,
 
     start_time: &'a mut Instant,
@@ -650,13 +638,13 @@ impl<'a> Session<'a> {
         let (engine_type, source_path, system_file_path, archive_path) = if rm2k_database_path.exists() {
             (EngineType::RM2K, input_dir.clone(), rm2k_database_path, None)
         } else {
+            // Games that ship only an `.rgss` archive have no data directory until `read` extracts it, and
+            // that's where the archive puts it.
             let source_path = ["data", "Data"]
                 .into_iter()
                 .map(|dir| input_dir.join(dir))
                 .find(|path| path.exists())
-                .context(
-                    "Could not find `data`/`Data` directory, or `RPG_RT.ldb` for an RPG Maker 2000/2003 project.",
-                )?;
+                .unwrap_or_else(|| input_dir.join("Data"));
 
             let type_paths = [
                 (EngineType::MVMZ, source_path.join("System.json"), None),
@@ -690,7 +678,8 @@ impl<'a> Session<'a> {
             else {
                 bail!(
                     "Couldn't determine game engine. Check the existence of `System` file inside `data`/`Data` \
-                     directory, `.rgss` archive, or `RPG_RT.ldb` in the input directory."
+                     directory, `.rgss` archive, or `RPG_RT.ldb` in the input directory ({}).",
+                    input_dir.display()
                 );
             };
 
@@ -798,6 +787,96 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
+    /// The settings to run with: what was passed explicitly on the command line, else what `.rvpacker-metadata`
+    /// recorded, else the defaults. `recorded` is [`None`] when there's no metadata to consult.
+    ///
+    /// The settings change the translation file format, so the recorded ones have to win over anything the user
+    /// didn't ask for - but a flag that was passed always wins, and a recorded `hashes` is passed through untouched.
+    fn merge_metadata(
+        &self,
+        duplicate_mode: Option<DuplicateMode>,
+        map_events: bool,
+        recorded: Option<Metadata>,
+    ) -> Metadata {
+        let recorded = recorded.unwrap_or_default();
+
+        Metadata {
+            duplicate_mode: duplicate_mode.unwrap_or(recorded.duplicate_mode),
+            line_separator: self.line_separator.clone().or(recorded.line_separator),
+            line_break: self.line_break.clone().or(recorded.line_break),
+            comment_prefix: self.comment_prefix.clone().or(recorded.comment_prefix),
+            read_encoding: self.read_encoding.clone().or(recorded.read_encoding),
+            // A flag can only turn the headers on. To turn them off, delete `.rvpacker-metadata`.
+            map_events: map_events || recorded.map_events,
+            hashes: recorded.hashes,
+        }
+    }
+
+    /// Extracts the game's `.rgss` archive into the input directory, unless the system file is already there.
+    ///
+    /// Entry names are decoded with `encoding` (UTF-8 when unset) - the same codepage the game's text is in, which
+    /// is also what older archives use for their names. Entries that don't decode are skipped with a warning
+    /// rather than written under a mangled name that could collide with another entry.
+    fn extract_archive(&self, encoding: Option<&'static Encoding>) -> Result<(), anyhow::Error> {
+        let Some(archive_path) = &self.archive_path else {
+            return Ok(());
+        };
+
+        if self.system_file_path.exists() {
+            return Ok(());
+        }
+
+        let encoding = encoding.unwrap_or(UTF_8);
+        let mut archive_data = read(archive_path).with_context(|| archive_path.display().to_string())?;
+        let mut decrypter = Decrypter::new();
+        let mut skipped: usize = 0;
+
+        for file in decrypter.decrypt(&mut archive_data)? {
+            let Some(decoded) = encoding.decode_without_bom_handling_and_without_replacement(file.path) else {
+                eprintln!(
+                    "warning: skipped an archive entry, its name isn't valid {}: {}",
+                    encoding.name(),
+                    String::from_utf8_lossy(file.path)
+                );
+                skipped += 1;
+                continue;
+            };
+
+            // Archives store paths with backslashes. Forward slashes work on every platform, including Windows.
+            let path = if decoded.contains('\\') {
+                Cow::Owned(decoded.replace('\\', "/"))
+            } else {
+                decoded
+            };
+
+            // The archive is untrusted: an absolute or `..` path would otherwise write outside the input directory.
+            if path.is_empty()
+                || !Path::new(&*path)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+            {
+                bail!("Archive entry {path:?} points outside the input directory.");
+            }
+
+            let output_file_path = self.input_dir.join(&*path);
+
+            if let Some(parent) = output_file_path.parent() {
+                create_dir_all(parent)?;
+            }
+
+            write(&output_file_path, file.data).with_context(|| output_file_path.display().to_string())?;
+        }
+
+        if skipped > 0 {
+            eprintln!(
+                "warning: {skipped} archive entries were skipped. If they matter, pass the right codepage to \
+                 `--read-encoding` and run again."
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn execute_read(&mut self, args: ReadArgs) -> Result<(), anyhow::Error> {
         if let Some(encoding) = args.probe_ini_title {
             return self.print_ini_title(encoding);
@@ -807,14 +886,14 @@ impl<'a> Session<'a> {
         let ignore = args.ignore;
         let skip_obsolete = args.skip_obsolete;
         let use_ini_title = args.use_ini_title;
+        let read_mode = args.read_mode;
+        let cli_map_events = args.map_events;
 
         let SharedArgs {
             skip_files,
-            read_mode,
-            mut duplicate_mode,
+            duplicate_mode,
             skip_maps,
             skip_events,
-            map_events,
         } = args.shared;
 
         let file_flags = FileFlags::all() & !skip_files.0;
@@ -823,26 +902,31 @@ impl<'a> Session<'a> {
             unreachable!("the read-mode parser only accepts `Read` variants")
         };
 
-        let mut hashes = None;
-        let mut line_separator = self.line_separator.clone();
-        let mut line_break = self.line_break.clone();
-        let mut comment_prefix = self.comment_prefix.clone();
-        let mut read_encoding = self.read_encoding.clone();
+        // Without `append` the metadata is only a source of settings, so a broken file must not stop a re-read that
+        // is about to replace it.
+        let recorded = match parse_metadata(&self.metadata_file_path) {
+            Ok(recorded) => recorded,
+            Err(error) if !append => {
+                eprintln!("warning: ignoring the unreadable `.rvpacker-metadata`: {error:#}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
 
-        if append && let Some(metadata) = parse_metadata(&self.metadata_file_path)? {
-            Metadata {
-                duplicate_mode,
-                line_separator,
-                line_break,
-                comment_prefix,
-                read_encoding,
-                hashes,
-            } = metadata;
-        }
+        let Metadata {
+            duplicate_mode,
+            line_separator,
+            line_break,
+            comment_prefix,
+            read_encoding,
+            map_events,
+            hashes,
+        } = self.merge_metadata(duplicate_mode, cli_map_events, recorded);
 
         apply_format_overrides(line_separator.as_ref(), line_break.as_ref(), comment_prefix.as_ref());
 
-        let hashes = hashes.unwrap_or_default();
+        // The hashes decide which files are skipped as unchanged, so only an append may build on the recorded ones.
+        let hashes = if append { hashes.unwrap_or_default() } else { HashMap::default() };
 
         if force && !silent {
             let start = Instant::now();
@@ -852,40 +936,25 @@ impl<'a> Session<'a> {
             stdin().read_line(&mut buf)?;
 
             if buf.trim_end() != "Y" {
+                println!("Aborted.");
                 exit(0);
             }
 
-            *self.start_time -= start.elapsed();
+            // The time spent waiting for the answer isn't the tool's.
+            *self.start_time += start.elapsed();
         }
 
         if append && ignore && !self.ignore_file_path.exists() {
             bail!("`.rvpacker-ignore` file does not exist. Aborting execution.");
         }
 
-        if let Some(archive_path) = &self.archive_path
-            && !self.system_file_path.exists()
-        {
-            let mut archive_data = read(archive_path)?;
-            let mut decrypter = Decrypter::new();
-            let decrypted_files = decrypter.decrypt(&mut archive_data)?;
+        let resolved_read_encoding = resolve_encoding(read_encoding.as_deref());
 
-            for file in decrypted_files {
-                let path = String::from_utf8_lossy(file.path);
-                let output_file_path = self.input_dir.join(path.as_ref());
-
-                if let Some(parent) = output_file_path.parent() {
-                    create_dir_all(parent)?;
-                }
-
-                write(output_file_path, file.data)?;
-            }
-        }
+        self.extract_archive(resolved_read_encoding)?;
 
         let mut flags = BaseFlags::empty();
         flags.set(BaseFlags::Ignore, ignore);
         flags.set(BaseFlags::SkipObsolete, skip_obsolete);
-
-        let resolved_read_encoding = resolve_encoding(read_encoding.as_deref());
 
         let mut processor = Processor {
             mode: read_mode,
@@ -913,6 +982,7 @@ impl<'a> Session<'a> {
             line_break,
             comment_prefix,
             read_encoding,
+            map_events,
             hashes: Some(processor.hashes),
         };
 
@@ -924,35 +994,28 @@ impl<'a> Session<'a> {
 
     pub fn execute_write(&self, args: SharedArgs) -> Result<(), anyhow::Error> {
         if !self.translation_path.exists() {
-            bail!("`translation` directory in the input directory does not exist.");
+            bail!("`{}` directory does not exist.", self.translation_path.display());
         }
 
         let SharedArgs {
             skip_files,
-            mut duplicate_mode,
+            duplicate_mode,
             skip_maps,
             skip_events,
-            ..
         } = args;
 
         let file_flags = FileFlags::all() & !skip_files.0;
-
-        let mut line_separator = self.line_separator.clone();
-        let mut line_break = self.line_break.clone();
-        let mut comment_prefix = self.comment_prefix.clone();
-        let mut read_encoding = self.read_encoding.clone();
         let write_encoding = self.write_encoding.clone();
 
-        if let Some(metadata) = parse_metadata(&self.metadata_file_path)? {
-            Metadata {
-                duplicate_mode,
-                line_separator,
-                line_break,
-                comment_prefix,
-                read_encoding,
-                hashes: _,
-            } = metadata;
-        }
+        // Event headers are comments in the translation files, `write` has nothing to do with them.
+        let Metadata {
+            duplicate_mode,
+            line_separator,
+            line_break,
+            comment_prefix,
+            read_encoding,
+            ..
+        } = self.merge_metadata(duplicate_mode, false, parse_metadata(&self.metadata_file_path)?);
 
         apply_format_overrides(line_separator.as_ref(), line_break.as_ref(), comment_prefix.as_ref());
 
@@ -985,30 +1048,24 @@ impl<'a> Session<'a> {
     pub fn execute_purge(&self, args: PurgeArgs) -> Result<(), anyhow::Error> {
         let SharedArgs {
             skip_files,
-            mut duplicate_mode,
+            duplicate_mode,
             skip_maps,
             skip_events,
-            ..
         } = args.shared;
 
         let file_flags = FileFlags::all() & !skip_files.0;
         let create_ignore = args.create_ignore;
 
-        let mut line_separator = self.line_separator.clone();
-        let mut line_break = self.line_break.clone();
-        let mut comment_prefix = self.comment_prefix.clone();
-        let mut read_encoding = self.read_encoding.clone();
-
-        if let Some(metadata) = parse_metadata(&self.metadata_file_path)? {
-            Metadata {
-                duplicate_mode,
-                line_separator,
-                line_break,
-                comment_prefix,
-                read_encoding,
-                hashes: _,
-            } = metadata;
-        }
+        // Without the headers on, purge rewrites the map files and drops the ones `read --map-events` wrote.
+        let Metadata {
+            duplicate_mode,
+            line_separator,
+            line_break,
+            comment_prefix,
+            read_encoding,
+            map_events,
+            ..
+        } = self.merge_metadata(duplicate_mode, args.map_events, parse_metadata(&self.metadata_file_path)?);
 
         apply_format_overrides(line_separator.as_ref(), line_break.as_ref(), comment_prefix.as_ref());
 
@@ -1026,6 +1083,7 @@ impl<'a> Session<'a> {
                 .into_iter()
                 .filter_map(|(name, ids)| resolve_file_type(&name, self.engine_type).map(|ft| (ft, ids)))
                 .collect(),
+            map_events,
             read_encoding: resolve_encoding(read_encoding.as_deref()),
             write_encoding: None,
             ..Default::default()
@@ -1065,6 +1123,7 @@ impl<'a> Session<'a> {
         match subcommand {
             JsonSubcommand::Generate { read_mode } => {
                 let force = matches!(read_mode, Mode::Read { force: true, .. });
+                self.extract_archive(resolve_encoding(self.read_encoding.as_deref()))?;
                 generate(&self.source_path, &json_path, force)?;
             }
             JsonSubcommand::Write => {
@@ -1083,7 +1142,7 @@ impl<'a> Session<'a> {
 
     pub fn execute_serde(&self, subcommand: &SerdeSubcommand) -> Result<(), anyhow::Error> {
         if !self.translation_path.exists() {
-            bail!("`translation` directory in the input directory does not exist.");
+            bail!("`{}` directory does not exist.", self.translation_path.display());
         }
 
         let serde_path = self.serde_dir();
@@ -1103,16 +1162,16 @@ impl<'a> Session<'a> {
                     let output_path = serde_path.join(format!("{stem}.{}", format.extension()));
                     let content = read_to_string(&path).with_context(|| path.display().to_string())?;
 
-                    match format {
-                        SerdeFormat::Json => write(&output_path, export_json(&content).map_err(|e| anyhow!("{e}"))?)?,
-                        SerdeFormat::Csv => write(&output_path, export_csv(&content).map_err(|e| anyhow!("{e}"))?)?,
-                        SerdeFormat::Xml => write(&output_path, export_xml(&content).map_err(|e| anyhow!("{e}"))?)?,
-                        SerdeFormat::Xlsx => {
-                            write(&output_path, export_xlsx(&content).map_err(|e| anyhow!("{e}"))?)?;
-                        }
-                        SerdeFormat::Yaml => write(&output_path, export_yaml(&content).map_err(|e| anyhow!("{e}"))?)?,
+                    let exported = match format {
+                        SerdeFormat::Json => export_json(&content).map(String::into_bytes),
+                        SerdeFormat::Csv => export_csv(&content).map(String::into_bytes),
+                        SerdeFormat::Xml => export_xml(&content).map(String::into_bytes),
+                        SerdeFormat::Xlsx => export_xlsx(&content),
+                        SerdeFormat::Yaml => export_yaml(&content).map(String::into_bytes),
                     }
+                    .map_err(|e| anyhow!("{}: {e}", path.display()))?;
 
+                    write(&output_path, exported).with_context(|| output_path.display().to_string())?;
                     println!("{}: Successfully exported.", output_path.display());
                 }
             }
@@ -1124,6 +1183,10 @@ impl<'a> Session<'a> {
                     );
                 }
 
+                // Convert everything before writing anything, so that a broken file doesn't leave the translation
+                // directory half-imported.
+                let mut imported = Vec::new();
+
                 for entry in read_dir(&serde_path)?.flatten() {
                     let path = entry.path();
 
@@ -1134,14 +1197,21 @@ impl<'a> Session<'a> {
                     let stem = path.file_stem().unwrap().to_string_lossy();
                     let output_path = self.translation_path.join(format!("{stem}.txt"));
 
-                    let content = match format {
-                        SerdeFormat::Json => import_json(&read_to_string(&path)?).map_err(|e| anyhow!("{e}"))?,
-                        SerdeFormat::Csv => import_csv(&read_to_string(&path)?).map_err(|e| anyhow!("{e}"))?,
-                        SerdeFormat::Xml => import_xml(&read_to_string(&path)?).map_err(|e| anyhow!("{e}"))?,
-                        SerdeFormat::Xlsx => import_xlsx(&read(&path)?).map_err(|e| anyhow!("{e}"))?,
-                        SerdeFormat::Yaml => import_yaml(&read_to_string(&path)?).map_err(|e| anyhow!("{e}"))?,
-                    };
+                    let text = || read_to_string(&path).with_context(|| path.display().to_string());
 
+                    let content = match format {
+                        SerdeFormat::Json => import_json(&text()?),
+                        SerdeFormat::Csv => import_csv(&text()?),
+                        SerdeFormat::Xml => import_xml(&text()?),
+                        SerdeFormat::Xlsx => import_xlsx(&read(&path).with_context(|| path.display().to_string())?),
+                        SerdeFormat::Yaml => import_yaml(&text()?),
+                    }
+                    .map_err(|e| anyhow!("{}: {e}", path.display()))?;
+
+                    imported.push((output_path, content));
+                }
+
+                for (output_path, content) in imported {
                     write(&output_path, content).with_context(|| output_path.display().to_string())?;
                     println!("{}: Successfully imported.", output_path.display());
                 }

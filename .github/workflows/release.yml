@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  BIN: rvpacker-txt-rs
+  RUSTFLAGS_COMMON: >-
+    -Ctarget-cpu=x86-64-v2
+    -Ctarget-feature=+aes,+sse2
+    -Copt-level=3
+    -Ccodegen-units=1
+    -Cpanic=abort
+    -Cstrip=symbols
+    -Cdebuginfo=0
+    -Cprefer-dynamic=no
+    -Cembed-bitcode=yes
+    -Cllvm-args=-function-sections=true
+    -Cllvm-args=-data-sections=true
+    -Cllvm-args=-fp-contract=fast
+    -Cllvm-args=-denormal-fp-math=positive-zero
+    -Cllvm-args=-enable-no-trapping-fp-math=true
+    -Cllvm-args=-unroll-threshold=750
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ext: tar.xz
+            about: x86_64-unknown-linux-musl
+            rustflags: -Clinker=clang-20 -Clinker-features=-lld -Clink-arg=-fuse-ld=lld
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: 7z
+            about: x86_64-pc-windows-msvc
+            rustflags: -Ctarget-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Clang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang-20 lld-20
+
+      - name: Install UPX (Linux)
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R upx/upx -p 'upx-*-amd64_linux.tar.xz' -O upx.tar.xz
+          mkdir upx
+          tar -xJf upx.tar.xz -C upx --strip-components=1
+          echo "$PWD/upx" >> "$GITHUB_PATH"
+
+      - name: Install UPX (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R upx/upx -p 'upx-*-win64.zip' -O upx.zip
+          7z x upx.zip -o"$RUNNER_TEMP/upx"
+          echo "$RUNNER_TEMP"/upx/upx-*-win64 >> "$GITHUB_PATH"
+
+      - name: Install cargo-about
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download -R EmbarkStudios/cargo-about -p 'cargo-about-*-${{ matrix.about }}.tar.gz' -O about.tar.gz
+          mkdir "$RUNNER_TEMP/about"
+          tar -xzf about.tar.gz -C "$RUNNER_TEMP/about" --strip-components=1
+          echo "$RUNNER_TEMP/about" >> "$GITHUB_PATH"
+
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ env.RUSTFLAGS_COMMON }} ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/$BIN LICENSE.md dist/
+          cargo about generate --target ${{ matrix.target }} about.hbs -o dist/THIRD-PARTY-NOTICE.md
+          upx --best --lzma --brute --ultra-brute --compress-exports=0 dist/$BIN
+          tar -cJf $BIN.tar.xz -C dist $BIN LICENSE.md THIRD-PARTY-NOTICE.md
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/$BIN.exe LICENSE.md dist/
+          cargo about generate --target ${{ matrix.target }} about.hbs -o dist/THIRD-PARTY-NOTICE.md
+          upx --best --lzma --brute --ultra-brute --compress-exports=0 dist/$BIN.exe
+          cd dist
+          7z a -t7z -m0=lzma2 -mx=9 ../$BIN.7z $BIN.exe LICENSE.md THIRD-PARTY-NOTICE.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.os }}
+          path: ${{ env.BIN }}.${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # Separate job: two matrix legs creating the same release at once can race.
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*

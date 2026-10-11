@@ -28,6 +28,8 @@ cargo install --path .
 
 Point `--input-dir` (`-i`, defaults to `./`) at a folder containing either a `data`/`Data` directory (XP/VX/VX Ace) or the MV/MZ equivalent, plus `Game.ini` and any `.rgss` archive for the older engines. The engine is detected automatically from whichever `System.*`/archive combination is present - there's nothing to select manually.
 
+A game that ships only an `.rgss` archive, with no `data`/`Data` directory, works too: `read` (and `json generate`) extract the archive into the input directory first. Names inside the archive are read as UTF-8, or as `--read-encoding` if you pass it; entries whose names don't decode are skipped with a warning, so for older Japanese archives pass `--read-encoding shift-jis`.
+
 RPG Maker 2000/2003 projects don't have a `data`/`Data` directory at all - `RPG_RT.ldb`, `RPG_RT.lmt` and every `MapNNNN.lmu` sit directly in the input directory, and that's what's checked for first. There's no `Scripts`/plugin equivalent for it, and no `.rgss` archive to decrypt.
 
 `read` writes `.txt` files into `<output-dir>/translation`; `write` reads them back and writes the game's files into `<output-dir>/output`. `--output-dir` (`-o`) defaults to the input directory, so translation and output both live alongside the game unless you say otherwise.
@@ -42,7 +44,7 @@ Reading the game's own text and writing a translation back are two independent d
 
 **`--write-encoding` defaults to unset, which always writes UTF-8 - leave it that way unless you know you need otherwise.** A translation is not generally representable in the source game's own codepage (Japanese `Shift-JIS` has no Cyrillic to translate a Russian translation into, for instance), and forcing the wrong one doesn't fail loudly - an unmappable character gets silently replaced with a literal `&#1055;`-style numeric reference spliced into the output. Only set `--write-encoding` when the target engine build has no Unicode-aware text renderer to fall back on - true of RPG Maker 2000/2003, XP and VX, which render through the OS's legacy ANSI codepage rather than decoding UTF-8 - _and_ the translation's own script fits inside the codepage you choose. Whoever runs the translated game then also needs their system (or a locale-emulation tool) set to that same codepage; on Windows 10 1903+, checking "Beta: Use Unicode UTF-8 for worldwide language support" under Region settings makes the default UTF-8 output work for these engines too, without any of this. VX Ace is Unicode-native, so its UTF-8 default just works regardless.
 
-Both flags accept the common Windows codepages: `utf-8`, `shift-jis`, `gb18030`, `euc-kr` (UHC/CP949), `big5`, and `windows-1250` through `windows-1258`. Whichever value is used on `read` is recorded in `.rvpacker-metadata`, so later `append`/`write`/`purge` runs pick both back up automatically without repeating the flags.
+Both flags accept the common Windows codepages: `utf-8`, `shift-jis`, `gb18030`, `euc-kr` (UHC/CP949), `big5`, and `windows-1250` through `windows-1258`. The `--read-encoding` used on `read` is recorded in `.rvpacker-metadata`, so later `read --read-mode append`/`write`/`purge` runs pick it back up automatically. `--write-encoding` is never recorded - pass it on every `write`.
 
 ### Translation file format
 
@@ -61,7 +63,9 @@ This is sample\#multiline text<#>This is translated sample\#multiline text
 
 ### `.rvpacker-metadata` and `.rvpacker-ignore`
 
-Every `read` writes `.rvpacker-metadata` into the `translation` directory, recording the duplicate mode, format settings (separator/break/prefix) and content hashes used for that run. Later `append`/`write`/`purge` runs load it back automatically.
+Every `read` writes `.rvpacker-metadata` into the `translation` directory, recording the duplicate mode, format settings (separator/break/prefix), whether `--map-events` was on, and content hashes used for that run. Every later run loads it back automatically.
+
+Precedence is the same for all of these settings: a flag you pass on the command line always wins, otherwise the recorded value is used, otherwise the default (`--duplicate-mode` defaults to `allow`). So repeating a flag on `read --read-mode append`/`write`/`purge` is never necessary, and passing one changes it for that run - and, on `read`, for the metadata written afterwards. `--map-events` can only be switched on this way; to switch it off, delete `.rvpacker-metadata` and `read` again. The recorded content hashes are only reused by `read` in `append` or `force-append` mode.
 
 `.rvpacker-ignore` lets you exclude specific lines from being extracted at all - handy for unused or duplicate content the game never actually shows. Pass `--ignore` on `read` to apply one, or `--create-ignore` on `purge` to generate one from whatever gets purged. See the [library's README](https://github.com/RPG-Maker-Translation-Tools/rvpacker-txt-rs-lib#rvpacker-ignore) for the file's syntax, and [`examples/.rvpacker-ignore`](https://github.com/RPG-Maker-Translation-Tools/rvpacker-txt-rs-lib/blob/main/examples/.rvpacker-ignore) for a working example.
 
@@ -76,6 +80,20 @@ Extracts text from the game's files into `translation/*.txt`.
 ```bash
 rvpacker-txt-rs read -i "C:/Game"
 ```
+
+`-r, --read-mode <MODE>` (alias `--mode`) picks what happens to existing translation files:
+
+- `default` - aborts if translation files already exist.
+- `append` - adds text that is new in the game, keeps existing translations, removes lines no longer used and sorts the lines.
+- `force` - rewrites existing translation files.
+- `force-append` - `append` plus `force`.
+
+`read`, `write` and `purge` share these options:
+
+- `-s, --skip-files <FILES>` (alias `--skip`) - comma-separated file kinds to leave out; `plugins` and `scripts` are interchangeable.
+- `--skip-maps <INDICES>` (alias `--sm`) - map ids to skip, e.g. `0,1,5-8`.
+- `--skip-events <SPEC>` (alias `--se`) - per-file event ids to skip, as `file:0,1,..;file:0,1,..`. Has no effect on maps.
+- `-d, --duplicate-mode <allow|remove>` (alias `--dup-mode`).
 
 ### `write`
 
@@ -132,11 +150,10 @@ These apply to every command:
 
 If you could, please consider supporting us through:
 
+- [Boosty](https://boosty.to/mcdeimos) (has lower fees)
 - [Ko-fi](https://ko-fi.com/savannstm)
-- [Patreon](https://www.patreon.com/cw/savannstm)
-- [Boosty](https://boosty.to/mcdeimos)
 
-Even if you don't, it's fine. We'll continue to do as we right now.
+Even if you don't, we will still continue working on the project anyways.
 
 ## License
 
