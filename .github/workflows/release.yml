@@ -2,9 +2,7 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches: [main]
 
 env:
   BIN: rvpacker-txt-rs
@@ -26,7 +24,23 @@ env:
     -Cllvm-args=-unroll-threshold=750
 
 jobs:
+  # Only a commit whose message contains "Release vX.Y.Z" gets a release; other pushes skip the build and release.
+  version:
+    if: contains(github.event.head_commit.message, 'Release v')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - id: tag
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          TAG=$(printf '%s\n' "$MESSAGE" | grep -oE 'Release v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 | cut -d' ' -f2)
+          [ -n "$TAG" ] || { echo "no 'Release vX.Y.Z' in the commit message"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -122,11 +136,14 @@ jobs:
 
   # Separate job: two matrix legs creating the same release at once can race.
   release:
-    needs: build
-    if: github.ref_type == 'tag'
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -134,6 +151,31 @@ jobs:
           merge-multiple: true
 
       - name: Release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: dist/*
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
+          ## Requirements
+
+          - x86-64-v2 baseline (SSE4.2, SSSE3, POPCNT, CMPXCHG16B)
+          - AES-NI
+
+          ## Default features
+
+          - gxhash
+          - mimalloc
+
+          ## Downloads
+
+          - Windows (x86-64): $BIN.7z
+          - Linux (x86-64): $BIN.tar.xz
+
+          Only Windows and Linux (x86-64) builds are published for this release.
+
+          Windows builds are statically linked against the C runtime and need no redistributables.
+          Linux builds need glibc 2.39 or newer.
+          Binaries are compressed with UPX, so some antivirus programs may flag them.
+          SHA-256 checksums are in SHA256SUMS.txt.
+
+          All changes can be seen in the [CHANGELOG.md](https://github.com/$GH_REPO/blob/$TAG/CHANGELOG.md).
+          EOF
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" --notes-file "$RUNNER_TEMP/notes.md"

@@ -1,44 +1,45 @@
 [package]
 name = "rvpacker-txt-rs"
-version = "18.0.0"
+version = "19.0.0"
 edition = "2024"
 rust-version = "1.88.0"
 license = "WTFPL"
+description = "Command-line tool that extracts translatable text from RPG Maker game files and writes translations back."
+repository = "https://github.com/RPG-Maker-Translation-Tools/rvpacker-txt-rs"
+
+[features]
+# gxhash needs AES-NI / Armv8 crypto; without it the maps fall back to rapidhash.
+default = ["gxhash", "mimalloc"]
+gxhash = ["rvpacker-lib/gxhash"]
+mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 anyhow = "1.0.104"
+asset-decrypter = { package = "rpgm-asset-decrypter-lib", version = "5.0.0" }
 clap = { version = "4.6.7", features = ["wrap_help", "cargo", "derive"] }
 clap-verbosity-flag = { version = "3.0.4", default-features = false, features = [
     "tracing",
 ] }
 encoding_rs = "0.8.42"
-gxhash = { version = "3.5.0", features = ["deterministic"] }
-rpgmad-lib = { version = "6.0.0" }
-rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "18.0.0", features = [
+mimalloc = { version = "0.1.52", optional = true }
+rpgmad-lib = { version = "7.0.0" }
+rvpacker-lib = { package = "rvpacker-txt-rs-lib", version = "19.0.0", default-features = false, features = [
     "serde-csv",
     "serde-xml",
     "serde-xlsx",
     "serde-yaml",
 ] }
-serde = "1.0.229"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
-strum = { version = "0.28.0", features = ["strum_macros"] }
 tracing-subscriber = "0.3.23"
+walkdir = "2.5.0"
 
 [profile.release]
 lto = "fat"
-debug = false
-debug-assertions = false
-overflow-checks = false
 codegen-units = 1
-opt-level = 3
 panic = "abort"
 strip = "symbols"
 
 [profile.release.build-override]
-debug = false
-debug-assertions = false
-overflow-checks = false
 codegen-units = 1
 opt-level = 3
-strip = "symbols"

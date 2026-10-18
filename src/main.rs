@@ -7,57 +7,64 @@ use clap::{
     crate_version, value_parser,
 };
 use clap_verbosity_flag::{InfoLevel, Verbosity};
-use encoding_rs::{
-    BIG5, EUC_KR, Encoding, GB18030, SHIFT_JIS, UTF_8, WINDOWS_1250, WINDOWS_1251, WINDOWS_1252, WINDOWS_1253,
-    WINDOWS_1254, WINDOWS_1255, WINDOWS_1256, WINDOWS_1257, WINDOWS_1258,
-};
-use gxhash::HashMap;
-use rpgmad_lib::Decrypter;
+use encoding_rs::{Encoding, UTF_8};
+use rpgmad_lib::decrypt_from_reader;
 use rvpacker_lib::{
-    BaseFlags, Mode, Processor, RPGMFileType, RVPACKER_IGNORE_FILE, RVPACKER_METADATA_FILE, get_ini_title,
-    get_ini_title_rm2k, json, set_comment_prefix, set_line_break, set_line_separator,
+    BaseFlags, HashMap, Mode, Processor, RPGMFileType, RVPACKER_IGNORE_FILE, RVPACKER_METADATA_FILE, get_ini_title,
+    get_ini_title_rm2k, json,
     serde::{
         export_csv, export_json, export_xlsx, export_xml, export_yaml, import_csv, import_json, import_xlsx,
         import_xml, import_yaml,
     },
+    set_comment_prefix, set_line_break, set_line_separator,
     types::{DuplicateMode, EngineType, FileFlags},
 };
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 use serde_json::{from_str, to_string};
 use std::{
     borrow::Cow,
-    fs::{create_dir_all, read, read_dir, read_to_string, write},
-    io::stdin,
+    fs::{File, create_dir_all, read, read_dir, read_to_string, write},
+    io::{BufReader, copy, stdin},
     mem::take,
     path::{Component, Path, PathBuf},
-    process::exit,
     str::FromStr,
     time::Instant,
 };
-use strum::VariantNames;
+
+mod archive;
+mod asset;
+
+use archive::{ArchiveCommand, execute as execute_archive};
+use asset::{AssetCommand, AssetOptions, execute as execute_asset};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Parses `0,1,5-8` into the indices it spells out. Empty parts are ignored.
-fn parse_indices(s: &str) -> Result<Vec<u16>, String> {
+fn parse_indices(s: &str) -> Result<Vec<u32>, String> {
     let mut indices = Vec::new();
 
     for part in s.split(',').map(str::trim).filter(|part| !part.is_empty()) {
         if let Some((a, b)) = part.split_once('-') {
             let (a, b) = (a.trim(), b.trim());
             let start = a
-                .parse::<u16>()
+                .parse::<u32>()
                 .map_err(|e| format!("Invalid start of range `{a}`: {e}"))?;
             let end = b
-                .parse::<u16>()
+                .parse::<u32>()
                 .map_err(|e| format!("Invalid end of range `{b}`: {e}"))?;
 
             if start > end {
                 return Err(format!("Range `{part}` is reversed (start > end)"));
             }
 
+            // deal with allocating billions of entries
+
             indices.extend(start..=end);
         } else {
             indices.push(
-                part.parse::<u16>()
+                part.parse::<u32>()
                     .map_err(|e| format!("Invalid integer `{part}`: {e}"))?,
             );
         }
@@ -67,7 +74,7 @@ fn parse_indices(s: &str) -> Result<Vec<u16>, String> {
 }
 
 #[derive(Clone, Debug)]
-pub struct SkipMaps(pub Vec<u16>);
+pub struct SkipMaps(pub Vec<u32>);
 
 impl FromStr for SkipMaps {
     type Err = String;
@@ -77,13 +84,10 @@ impl FromStr for SkipMaps {
     }
 }
 
-/// Holds the raw `file:0,1,..` file-kind name rather than an already-resolved
-/// [`RPGMFileType`]: which variant a name like `"actors"` means depends on the
-/// engine (MV/VX's `RPGMFileType::Actors` vs. RM2K's `RPGMFileType::Rm2kActors`),
-/// and the engine isn't known yet when arguments are parsed - see
-/// [`resolve_file_type`].
+/// Raw file-kind name, not yet an [`RPGMFileType`]: the engine that gives it meaning isn't known at parse time.
+/// See [`resolve_file_type`].
 #[derive(Clone, Debug)]
-pub struct SkipEvents(pub Vec<(String, Vec<u16>)>);
+pub struct SkipEvents(pub Vec<(String, Vec<u32>)>);
 
 impl FromStr for SkipEvents {
     type Err = String;
@@ -99,126 +103,114 @@ impl FromStr for SkipEvents {
             result.push((file.trim().to_string(), parse_indices(indices)?));
         }
 
-        Ok(SkipEvents(result))
+        Ok(Self(result))
     }
 }
 
-/// Resolves a `--skip-events` file-kind name to the [`RPGMFileType`] variant
-/// the given engine actually uses for it.
+const SKIP_EVENT_NAMES: &str = "actors, armors, classes, commonevents, enemies, items, skills, states, troops, weapons";
+const RM2K_SKIP_EVENT_NAMES: &str = "actors, classes, commonevents, enemies, items, skills, states, terms, troops";
+
+/// Resolves a `--skip-events` file-kind name to the engine's [`RPGMFileType`] variant.
 ///
-/// Non-RM2K resolve through [`RPGMFileType::from_filename`]'s first-three-bytes
-/// matching, same as a real file name would; RM2K has no per-kind file names
-/// to match against (`RPG_RT.ldb` bundles every kind into one file), so its
-/// names are matched directly against the same names the library's own
-/// `.txt` output uses (`actors.txt`, `skills.txt`, ...).
-fn resolve_file_type(name: &str, engine_type: EngineType) -> Option<RPGMFileType> {
-    if engine_type != EngineType::RM2K {
-        let file_type = RPGMFileType::from_filename(name);
-
-        // `from_filename` maps anything it doesn't know to `Invalid`, and maps have no events to skip.
-        if matches!(file_type, RPGMFileType::Invalid | RPGMFileType::Map) {
-            eprintln!("warning: `{name}` is not a file kind that has events to skip; ignoring it");
-            return None;
-        }
-
-        return Some(file_type);
-    }
-
-    Some(match name.to_ascii_lowercase().as_str() {
-        "actors" => RPGMFileType::Rm2kActors,
-        "skills" => RPGMFileType::Rm2kSkills,
-        "items" => RPGMFileType::Rm2kItems,
-        "enemies" => RPGMFileType::Rm2kEnemies,
-        "troops" => RPGMFileType::Rm2kTroops,
-        "classes" => RPGMFileType::Rm2kClasses,
-        "commonevents" => RPGMFileType::Rm2kCommonEvents,
-        "states" => RPGMFileType::Rm2kStates,
-        "terms" => RPGMFileType::Rm2kTerms,
+/// Names must match exactly: prefix matching would let a typo like `acts` mean `actors`. An unknown name is an error,
+/// since skipping nothing silently would leave events in the output that the user meant to skip.
+fn resolve_file_type(name: &str, engine_type: EngineType) -> Result<RPGMFileType, String> {
+    let file_type = match (engine_type == EngineType::RM2K, name.to_ascii_lowercase().as_str()) {
+        (false, "actors") => RPGMFileType::Actors,
+        (false, "armors") => RPGMFileType::Armors,
+        (false, "classes") => RPGMFileType::Classes,
+        (false, "commonevents") => RPGMFileType::Events,
+        (false, "enemies") => RPGMFileType::Enemies,
+        (false, "items") => RPGMFileType::Items,
+        (false, "skills") => RPGMFileType::Skills,
+        (false, "states") => RPGMFileType::States,
+        (false, "troops") => RPGMFileType::Troops,
+        (false, "weapons") => RPGMFileType::Weapons,
+        (true, "actors") => RPGMFileType::Rm2kActors,
+        (true, "skills") => RPGMFileType::Rm2kSkills,
+        (true, "items") => RPGMFileType::Rm2kItems,
+        (true, "enemies") => RPGMFileType::Rm2kEnemies,
+        (true, "troops") => RPGMFileType::Rm2kTroops,
+        (true, "classes") => RPGMFileType::Rm2kClasses,
+        (true, "commonevents") => RPGMFileType::Rm2kCommonEvents,
+        (true, "states") => RPGMFileType::Rm2kStates,
+        (true, "terms") => RPGMFileType::Rm2kTerms,
         _ => {
-            eprintln!("warning: `{name}` is not a recognized RPG Maker 2000/2003 file kind; ignoring it");
-            return None;
+            let expected = if engine_type == EngineType::RM2K {
+                RM2K_SKIP_EVENT_NAMES
+            } else {
+                SKIP_EVENT_NAMES
+            };
+
+            return Err(format!(
+                "`{name}` is not a file kind with events to skip for this engine. Expected one of: {expected}"
+            ));
         }
-    })
+    };
+
+    Ok(file_type)
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct FFlags(pub FileFlags);
 
 impl FromStr for FFlags {
-    type Err = <FileFlags as FromStr>::Err;
+    type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut flags = FileFlags::empty();
 
-        for flag_str in s.split(',').filter(|s| !s.is_empty()) {
-            let flag = FileFlags::from_str(flag_str)?;
-            flags.insert(flag);
+        for name in s.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+            flags.insert(resolve_file_kind(name)?);
         }
 
-        Ok(FFlags(flags))
+        Ok(Self(flags))
     }
 }
 
-/// Codepages the library can't detect on its own: `Game.ini`'s/`RPG_RT.ini`'s
-/// title, and the general text-decoding override ([`Session::encoding`]) that
-/// the library needs for the same engines' scripts and for RM2K, none of
-/// which record their encoding anywhere in the file.
+const FILE_KIND_NAMES: &str = "map, actors, armors, classes, commonevents, enemies, items, skills, states, system, \
+                               troops, weapons, scripts, plugins, database";
+
+/// Resolves a `--skip-files` name, ignoring case. Names must match exactly: prefix matching would let a typo like
+/// `actress` mean actors.
+fn resolve_file_kind(name: &str) -> Result<FileFlags, String> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "actors" => FileFlags::Actors,
+        "armors" => FileFlags::Armors,
+        "classes" => FileFlags::Classes,
+        "commonevents" => FileFlags::CommonEvents,
+        "database" => FileFlags::Database,
+        "enemies" => FileFlags::Enemies,
+        "items" => FileFlags::Items,
+        "map" => FileFlags::Map,
+        "plugins" | "scripts" => FileFlags::Scripts,
+        "skills" => FileFlags::Skills,
+        "states" => FileFlags::States,
+        "system" => FileFlags::System,
+        "troops" => FileFlags::Troops,
+        "weapons" => FileFlags::Weapons,
+        _ => {
+            return Err(format!(
+                "`{name}` is not a file kind. Expected one of: {FILE_KIND_NAMES}"
+            ));
+        }
+    })
+}
+
+/// Parses a codepage by its WHATWG label (`shift-jis`, `windows-1251`, ...).
 ///
-/// There is no way to detect any of these from the bytes alone, so the user
-/// has to say which one it is - see `--read-encoding`/`--probe-ini-title`.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum TextEncoding {
-    #[value(name = "utf-8")]
-    Utf8,
-    #[value(name = "shift-jis")]
-    ShiftJis,
-    #[value(name = "gb18030")]
-    Gb18030,
-    /// UHC/CP949 - the WHATWG Encoding Standard's "EUC-KR" label is actually
-    /// this superset, not the original EUC-KR.
-    #[value(name = "euc-kr")]
-    EucKr,
-    #[value(name = "big5")]
-    Big5,
-    #[value(name = "windows-1250")]
-    Windows1250,
-    #[value(name = "windows-1251")]
-    Windows1251,
-    #[value(name = "windows-1252")]
-    Windows1252,
-    #[value(name = "windows-1253")]
-    Windows1253,
-    #[value(name = "windows-1254")]
-    Windows1254,
-    #[value(name = "windows-1255")]
-    Windows1255,
-    #[value(name = "windows-1256")]
-    Windows1256,
-    #[value(name = "windows-1257")]
-    Windows1257,
-    #[value(name = "windows-1258")]
-    Windows1258,
-}
+/// Rejects non-ASCII-compatible codepages (UTF-16 and friends): decoding game text as one silently produces garbage.
+/// Game files often carry no encoding, so the user has to name one. The `euc-kr` label is UHC/CP949.
+fn parse_encoding(label: &str) -> Result<&'static Encoding, String> {
+    let encoding = Encoding::for_label(label.as_bytes()).ok_or_else(|| format!("`{label}` is not a known encoding"))?;
 
-impl TextEncoding {
-    fn as_encoding(self) -> &'static Encoding {
-        match self {
-            Self::Utf8 => UTF_8,
-            Self::ShiftJis => SHIFT_JIS,
-            Self::Gb18030 => GB18030,
-            Self::EucKr => EUC_KR,
-            Self::Big5 => BIG5,
-            Self::Windows1250 => WINDOWS_1250,
-            Self::Windows1251 => WINDOWS_1251,
-            Self::Windows1252 => WINDOWS_1252,
-            Self::Windows1253 => WINDOWS_1253,
-            Self::Windows1254 => WINDOWS_1254,
-            Self::Windows1255 => WINDOWS_1255,
-            Self::Windows1256 => WINDOWS_1256,
-            Self::Windows1257 => WINDOWS_1257,
-            Self::Windows1258 => WINDOWS_1258,
-        }
+    if !encoding.is_ascii_compatible() {
+        return Err(format!(
+            "`{label}` is not ASCII-compatible, so it can't be used for game text"
+        ));
     }
+
+    Ok(encoding)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -228,23 +220,19 @@ struct Metadata {
     line_separator: Option<String>,
     line_break: Option<String>,
     comment_prefix: Option<String>,
-    /// The codepage's canonical WHATWG label (`encoding_rs`'s `Encoding::name()`),
-    /// so it round-trips through [`Encoding::for_label`] without a custom
-    /// `Serialize`/`Deserialize` impl for [`TextEncoding`].
-    ///
-    /// Matters on write too, not just read: recovering a source line to look
-    /// it up in the translation file requires decoding it the same way it
-    /// was decoded when the `.txt` was produced.
+    /// Canonical WHATWG label, so it round-trips through [`Encoding::for_label`].
+    /// Also needed on write: source lines are looked up in the `.txt`, which must be decoded the same way it was produced.
     read_encoding: Option<String>,
-    /// Whether `read` recorded event headers. `append` and `purge` regenerate the translation files from the game
-    /// and drop whatever headers they aren't told to write, so this has to be remembered like the format settings.
-    /// Absent in metadata written before it existed, which means off.
+    /// Whether `read` recorded event headers. `append`/`purge` regenerate the files and would drop them otherwise.
+    /// Absent in older metadata, meaning off.
     #[serde(default)]
     map_events: bool,
     #[serde(serialize_with = "serialize_sorted_hashes")]
     hashes: Option<HashMap<String, u64>>,
 }
 
+// serde's serialize_with hands the field over as &Option<T>, so the reference has to stay.
+#[allow(clippy::ref_option)]
 fn serialize_sorted_hashes<S>(hashes: &Option<HashMap<String, u64>>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -263,9 +251,8 @@ where
     }
 }
 
-/// Resolves a codepage's canonical WHATWG label (as stored in
-/// `.rvpacker-metadata`/produced by [`TextEncoding::as_encoding`]) back to an
-/// [`Encoding`], for [`Processor::read_encoding`]/[`Processor::write_encoding`].
+/// Resolves a codepage's canonical WHATWG label (as stored in `.rvpacker-metadata`, from [`Encoding::name`]) back to
+/// an [`Encoding`], for [`Processor::read_encoding`]/[`Processor::write_encoding`].
 fn resolve_encoding(label: Option<&str>) -> Option<&'static Encoding> {
     let label = label?;
     let encoding = Encoding::for_label(label.as_bytes());
@@ -297,7 +284,9 @@ fn apply_format_overrides(
 
 #[derive(Args, Debug)]
 struct SharedArgs {
-    /// Skips processing specified files, separated by comma. `plugins` can be used interchangeably with `scripts`
+    /// Skips processing specified file kinds, separated by comma. Names must match exactly, ignoring case:
+    /// `map`, `actors`, `armors`, `classes`, `commonevents`, `enemies`, `items`, `skills`, `states`, `system`, `troops`,
+    /// `weapons`, `scripts`, `database` (RM2K only). `plugins` is the same as `scripts`.
     #[arg(
         short,
         long,
@@ -319,8 +308,9 @@ struct SharedArgs {
     )]
     skip_maps: SkipMaps,
 
-    /// Skips processing specified events. Has no effect on maps.
-    /// Follows the following syntax: `file:0,1,..;file:0,1,..`
+    /// Skips specified events. Has no effect on maps.
+    /// Syntax: `file:0,1,..;file:0,1,..`. File names must match exactly, ignoring case: `actors`, `commonevents`, ...
+    /// An unknown name is an error. RM2K takes its own set of names.
     #[arg(
         long,
         alias = "se",
@@ -337,7 +327,7 @@ struct SharedArgs {
         long,
         alias = "dup-mode",
         display_order = 93,
-        value_parser = PossibleValuesParser::new(DuplicateMode::VARIANTS).map(|s| DuplicateMode::from_str(&s).unwrap())
+        value_parser = PossibleValuesParser::new(["allow", "remove"]).map(|s| DuplicateMode::from_str(&s).unwrap())
     )]
     duplicate_mode: Option<DuplicateMode>,
 }
@@ -345,10 +335,11 @@ struct SharedArgs {
 #[derive(Args, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct ReadArgs {
-    /// Defines how to read files.
-    /// `default` - If encounters existing translation files, aborts read.
-    /// `append` - Appends any new text from the game to the translation files, if the text is not already present. Unused lines are removed from translation files, and the lines order is sorted.
-    /// `force` - Force rewrites existing translation files
+    /// How to handle existing translation files.
+    /// `default` - Leaves existing translation files alone, and writes only the missing ones.
+    /// `append` - Adds new game text not already present, skips files unchanged since the last read, and keeps translations for text no longer in the game (see `--skip-obsolete`).
+    /// `force` - Rewrites existing translation files, after asking for confirmation.
+    /// `force-append` - `append` plus `force`, which bypasses the hash check.
     #[arg(
         short,
         long,
@@ -367,26 +358,20 @@ struct ReadArgs {
     #[arg(short = 'I', long, action = ArgAction::SetTrue)]
     ignore: bool,
 
+    /// With `append`, drops translations for text no longer in the game, instead of keeping them.
     #[arg(long, alias = "so", action = ArgAction::SetTrue)]
     skip_obsolete: bool,
 
-    /// Parse information about map events for the map files.
-    /// This will give you more info about where the text of the event happens.
-    /// Recorded in `.rvpacker-metadata`, so `append` and `purge` keep the event headers without it.
+    /// Records where in the map events each line comes from. Recorded in `.rvpacker-metadata`, so `append`/`purge` keep it.
     #[arg(short, long, alias = "me", action = ArgAction::SetTrue)]
     map_events: bool,
 
-    /// Decodes `Game.ini`'s (or, if absent, `RPG_RT.ini`'s) title with the
-    /// given encoding and prints it, without reading anything else. Use this
-    /// to find the right encoding before passing it to `--read-encoding`.
-    #[arg(long, value_name = "ENCODING")]
-    probe_ini_title: Option<TextEncoding>,
+    /// Prints `Game.ini`'s (or, if absent, `RPG_RT.ini`'s) title decoded with the given encoding, to help find `--read-encoding`.
+    #[arg(long, value_name = "ENCODING", value_parser = parse_encoding)]
+    probe_ini_title: Option<&'static Encoding>,
 
-    /// Whether to parse the game's title out of `Game.ini`/`RPG_RT.ini` at
-    /// all. Left unset, neither file is touched. When set, the title is
-    /// decoded with `--read-encoding` - overriding whatever the system file's
-    /// own title field carries. Guessing the wrong encoding would silently
-    /// corrupt it, so this stays opt-in.
+    /// Overrides the system file's title with the one decoded from `Game.ini`/`RPG_RT.ini` using `--read-encoding`.
+    /// Opt-in: a wrong encoding silently corrupts the title.
     #[arg(long, action = ArgAction::SetTrue)]
     use_ini_title: bool,
 
@@ -400,8 +385,7 @@ struct PurgeArgs {
     #[arg(short, long, action = ArgAction::SetTrue, display_order = 23)]
     create_ignore: bool,
 
-    /// Keeps the event headers of the map files. Not needed if `read` was run with `--map-events`: it's recorded in
-    /// `.rvpacker-metadata`.
+    /// Keeps map event headers. Not needed if `read` used `--map-events`, which is recorded in `.rvpacker-metadata`.
     #[arg(short, long, alias = "me", action = ArgAction::SetTrue)]
     map_events: bool,
 
@@ -440,7 +424,7 @@ enum SerdeFormat {
 }
 
 impl SerdeFormat {
-    fn extension(self) -> &'static str {
+    const fn extension(self) -> &'static str {
         match self {
             Self::Json => "json",
             Self::Csv => "csv",
@@ -478,25 +462,42 @@ enum Command {
     /// Purges lines without translation from translation files
     Purge(PurgeArgs),
 
-    /// Provides the commands for JSON generation and writing
+    /// JSON generation and writing commands
     Json {
         #[command(subcommand)]
         subcommand: JsonSubcommand,
     },
 
-    /// Provides the commands for exporting/importing translation files to/from structured formats
+    /// Exports/imports translation files to/from structured formats
     /// (JSON, CSV, XML, XLSX, YAML)
     Serde {
         #[command(subcommand)]
         subcommand: SerdeSubcommand,
     },
+
+    /// Decrypts/encrypts RPG Maker MV/MZ audio and image assets, without any game parsing. Uses `-i`/`-o` as directories
+    Asset {
+        #[command(flatten)]
+        options: AssetOptions,
+
+        #[command(subcommand)]
+        command: AssetCommand,
+    },
+
+    /// Decrypts/encrypts RPG Maker XP/VX/VX Ace `.rgss` archives, without any game parsing. Uses `-i`/`-o` as paths
+    Archive {
+        #[command(subcommand)]
+        subcommand: ArchiveCommand,
+    },
 }
 
-/// This tool allows to parse RPG Maker 2000/2003/XP/VX/VXAce/MV/MZ games text to `.txt` files and write them back to their initial form. For MV/MZ/XP/VX/VXAce, the program uses `data` or `Data` directories for source files and decrypts any `.rgss` archive if it's present; for RPG Maker 2000/2003, it looks for `RPG_RT.ldb` directly in the input directory. `translation` directory holds the translation files either way.
+/// Parses RPG Maker 2000/2003/XP/VX/VX Ace/MV/MZ game text to `.txt` files and writes them back. MV/MZ/XP/VX/VX Ace read
+/// the `data`/`Data` directory and decrypt any `.rgss` archive; RPG Maker 2000/2003 read `RPG_RT.ldb` from the input directory.
+/// Translation files go in `translation`.
 #[derive(Debug, Parser)]
 #[command(version = crate_version!(), next_line_help = true, term_width = 120)]
 struct Cli {
-    /// Input directory, containing game files
+    /// Input directory containing the game files. For MV/MZ, pass the `www` folder.
     #[arg(short, long, global = true, default_value = "./", value_name = "INPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 1)]
     input_dir: PathBuf,
 
@@ -504,68 +505,44 @@ struct Cli {
     #[arg(short, long, global = true, value_name = "OUTPUT_PATH", value_parser = value_parser!(PathBuf), display_order = 2)]
     output_dir: Option<PathBuf>,
 
-    /// Separator between the source and translation columns of a translation line.
-    /// Defaults to the library's own default (`<#>`). Left unset, the value recorded
-    /// in `.rvpacker-metadata` is used.
+    /// Separator between the source and translation columns. Defaults to `<#>`; unset uses the value in `.rvpacker-metadata`.
     #[arg(long, global = true, value_name = "SEPARATOR", display_order = 4)]
     line_separator: Option<String>,
 
-    /// Marker that source/translation line breaks are normalized to in translation files.
-    /// Defaults to the library's own default (`\#`). Left unset, the value recorded
-    /// in `.rvpacker-metadata` is used.
+    /// Marker that line breaks are normalized to in translation files. Defaults to `\#`; unset uses the value in `.rvpacker-metadata`.
     #[arg(long, global = true, value_name = "BREAK", display_order = 5)]
     line_break: Option<String>,
 
-    /// Prefix marking a line in translation files as a comment (`ID`, `NAME`, ignore
-    /// entries, etc). Defaults to the library's own default (`<!>`). Left unset, the
-    /// value recorded in `.rvpacker-metadata` is used.
+    /// Prefix marking a translation line as a comment (`ID`, `NAME`, ignore entries, ...). Defaults to `<!>`; unset uses the value in `.rvpacker-metadata`.
     #[arg(long, global = true, value_name = "PREFIX", display_order = 6)]
     comment_prefix: Option<String>,
 
-    /// Forces decoding of the game's own source text to the given codepage,
-    /// instead of guessing it. Needed for RPG Maker 2000/2003 (whose files
-    /// carry no encoding at all) and XP/VX (same, plus `Scripts.*`) - without
-    /// it, the library just tries a fixed list of common codepages and keeps
-    /// the first one that decodes without errors. VX Ace tags most strings
-    /// with their real encoding already and only falls back to this for the
-    /// rare one that doesn't. Matters on write as well as read - recovering a
-    /// source line to look it up in the translation file needs the same
-    /// decoding that produced that `.txt` in the first place.
+    /// Codepage to decode the game's own text with. Needed for RPG Maker 2000/2003 and XP/VX `Scripts.*`, which store
+    /// no encoding; unset and unrecorded, text is read as UTF-8 and text that isn't valid in it fails the run. VX Ace rarely needs it.
     ///
-    /// Tip: `--probe-ini-title`/`--use-ini-title` can help find the right value
-    /// - `Game.ini`'s/`RPG_RT.ini`'s title is the one field in that file that
-    /// can carry non-ASCII bytes, and when it does, it was written by RPG
-    /// Maker's editor in the original developer's own codepage - the same
-    /// one the rest of the game's text uses.
+    /// Also used on write, to decode source lines when looking them up. `--probe-ini-title`/`--use-ini-title` help find
+    /// the value: the `Game.ini` title is written in the same codepage as the rest of the game's text.
     ///
-    /// Independent of `--write-encoding` - see its help text for why. Left unset,
-    /// the value recorded in `.rvpacker-metadata` is used.
-    #[arg(long, global = true, value_name = "ENCODING", display_order = 7)]
-    read_encoding: Option<TextEncoding>,
+    /// Independent of `--write-encoding`. Unset, the value recorded in `.rvpacker-metadata` is used.
+    #[arg(long, global = true, value_name = "ENCODING", value_parser = parse_encoding, display_order = 7)]
+    read_encoding: Option<&'static Encoding>,
 
-    /// Forces encoding of translated text to the given codepage when writing
-    /// it back, instead of always writing plain UTF-8.
+    /// Codepage to encode translated text with when writing. Unset writes UTF-8, which can't silently mangle a translation.
     ///
-    /// Leave this unset. UTF-8 is the only choice that can't silently corrupt
-    /// a translation written in a different script than the source game's -
-    /// a Japanese (`Shift_JIS`) game translated into Russian cannot be
-    /// re-encoded as `Shift_JIS` at all, and attempting it doesn't fail loudly:
-    /// per the WHATWG encoding standard, an unmappable character is replaced
-    /// with a literal decimal numeric-character-reference (`П` becomes the
-    /// eight bytes `&#1055;`) spliced into the output.
+    /// Only set this if the target engine has no Unicode text rendering (RPG Maker 2000/2003, XP, VX), the translation
+    /// fits the codepage, and the player's system uses it too. Unmappable characters become `&#NNNN;` references
+    /// silently, so a mismatch doesn't fail loudly.
     ///
-    /// Only override this if the target engine build has no Unicode-aware
-    /// text renderer - true of RPG Maker 2000/2003, XP and VX, which render
-    /// through the OS's legacy ANSI codepage rather than decoding UTF-8 - AND
-    /// the translation's own script fits inside the codepage you pass here.
-    /// Whoever runs the translated game then also needs their system (or a
-    /// locale emulator) set to that same codepage. VX Ace is Unicode-native,
-    /// so its UTF-8 default already works correctly without this.
+    /// Independent of `--read-encoding`. Never recorded in `.rvpacker-metadata`, so pass it on every `write`.
+    #[arg(long, global = true, value_name = "ENCODING", value_parser = parse_encoding, display_order = 8)]
+    write_encoding: Option<&'static Encoding>,
+
+    /// Codepage the file names inside a `.rgss` archive decode with, when `read` or `json generate` extracts it. Unset,
+    /// `--read-encoding` is used.
     ///
-    /// Independent of `--read-encoding`. Never recorded in `.rvpacker-metadata`,
-    /// so pass it on every `write`.
-    #[arg(long, global = true, value_name = "ENCODING", display_order = 8)]
-    write_encoding: Option<TextEncoding>,
+    /// Not recorded in `.rvpacker-metadata`, as the archive is extracted once, when the system file is missing.
+    #[arg(long, global = true, value_name = "ENCODING", value_parser = parse_encoding, display_order = 9)]
+    archive_read_encoding: Option<&'static Encoding>,
 
     #[command(subcommand)]
     command: Command,
@@ -607,6 +584,7 @@ struct Session<'a> {
     /// The codepage's canonical WHATWG label - see [`Metadata::read_encoding`].
     read_encoding: Option<String>,
     write_encoding: Option<String>,
+    archive_read_encoding: Option<&'static Encoding>,
 
     start_time: &'a mut Instant,
 }
@@ -629,17 +607,13 @@ impl<'a> Session<'a> {
         let metadata_file_path = translation_path.join(RVPACKER_METADATA_FILE);
         let ignore_file_path = translation_path.join(RVPACKER_IGNORE_FILE);
 
-        // RPG Maker 2000/2003 keeps every file at the project root - `RPG_RT.ldb`,
-        // rather than a `System.*` file in a `data`/`Data` directory, is what
-        // marks a project as one. Checked first because there's no `data`/`Data`
-        // directory to require in that case.
+        // 2000/2003 keep their files at the project root with no `data`/`Data` directory, so check `RPG_RT.ldb` first.
         let rm2k_database_path = input_dir.join("RPG_RT.ldb");
 
         let (engine_type, source_path, system_file_path, archive_path) = if rm2k_database_path.exists() {
             (EngineType::RM2K, input_dir.clone(), rm2k_database_path, None)
         } else {
-            // Games that ship only an `.rgss` archive have no data directory until `read` extracts it, and
-            // that's where the archive puts it.
+            // Archive-only games get their data directory when `read` extracts the archive.
             let source_path = ["data", "Data"]
                 .into_iter()
                 .map(|dir| input_dir.join(dir))
@@ -692,8 +666,9 @@ impl<'a> Session<'a> {
         let line_separator = take(&mut cli.line_separator);
         let line_break = take(&mut cli.line_break);
         let comment_prefix = take(&mut cli.comment_prefix);
-        let read_encoding = take(&mut cli.read_encoding).map(|e| e.as_encoding().name().to_string());
-        let write_encoding = take(&mut cli.write_encoding).map(|e| e.as_encoding().name().to_string());
+        let read_encoding = take(&mut cli.read_encoding).map(|e| e.name().to_string());
+        let write_encoding = take(&mut cli.write_encoding).map(|e| e.name().to_string());
+        let archive_read_encoding = take(&mut cli.archive_read_encoding);
 
         Ok(Self {
             engine_type,
@@ -712,12 +687,12 @@ impl<'a> Session<'a> {
             comment_prefix,
             read_encoding,
             write_encoding,
+            archive_read_encoding,
             start_time,
         })
     }
 
-    /// Reads whichever of `Game.ini`/`RPG_RT.ini` is present - probing
-    /// `Game.ini` first - and extracts the raw title bytes from it.
+    /// Reads the raw title bytes from `Game.ini`, or from `RPG_RT.ini` if `Game.ini` is absent.
     fn read_ini_title(&self) -> Result<Vec<u8>, anyhow::Error> {
         if self.engine_type.is_mvmz() {
             bail!(
@@ -774,9 +749,9 @@ impl<'a> Session<'a> {
 
     /// Decodes `Game.ini`'s (or, if absent, `RPG_RT.ini`'s) title with
     /// `encoding` and prints it, for `--probe-ini-title`. Reads nothing else.
-    fn print_ini_title(&self, encoding: TextEncoding) -> Result<(), anyhow::Error> {
+    fn print_ini_title(&self, encoding: &'static Encoding) -> Result<(), anyhow::Error> {
         let title_bytes = self.read_ini_title()?;
-        let (title, _, had_errors) = encoding.as_encoding().decode(&title_bytes);
+        let (title, _, had_errors) = encoding.decode(&title_bytes);
 
         println!("{title}");
 
@@ -787,11 +762,34 @@ impl<'a> Session<'a> {
         Ok(())
     }
 
-    /// The settings to run with: what was passed explicitly on the command line, else what `.rvpacker-metadata`
-    /// recorded, else the defaults. `recorded` is [`None`] when there's no metadata to consult.
-    ///
-    /// The settings change the translation file format, so the recorded ones have to win over anything the user
-    /// didn't ask for - but a flag that was passed always wins, and a recorded `hashes` is passed through untouched.
+    /// Turns the `--skip-events` names into the file kinds the library keys its skip lists by.
+    /// Fails on the first unknown name.
+    fn skip_event_kinds(&self, skip_events: SkipEvents) -> Result<Vec<(RPGMFileType, Vec<u32>)>, anyhow::Error> {
+        skip_events
+            .0
+            .into_iter()
+            .map(|(name, ids)| {
+                let file_type = resolve_file_type(&name, self.engine_type).map_err(|error| anyhow!(error))?;
+                Ok((file_type, ids))
+            })
+            .collect()
+    }
+
+    /// Whether a setting that changes the translation text was passed on the command line with a value other than the
+    /// recorded one.
+    fn text_settings_changed(&self, cli_map_events: bool, recorded: &Metadata) -> bool {
+        let differs =
+            |cli: Option<&String>, recorded: &Option<String>| cli.is_some_and(|cli| recorded.as_ref() != Some(cli));
+
+        differs(self.line_separator.as_ref(), &recorded.line_separator)
+            || differs(self.line_break.as_ref(), &recorded.line_break)
+            || differs(self.comment_prefix.as_ref(), &recorded.comment_prefix)
+            || differs(self.read_encoding.as_ref(), &recorded.read_encoding)
+            || (cli_map_events && !recorded.map_events)
+    }
+
+    /// Precedence: explicit command-line flag, then `.rvpacker-metadata`, then defaults. Recorded format settings win
+    /// over anything the user didn't ask for. A recorded `hashes` passes through untouched.
     fn merge_metadata(
         &self,
         duplicate_mode: Option<DuplicateMode>,
@@ -812,12 +810,10 @@ impl<'a> Session<'a> {
         }
     }
 
-    /// Extracts the game's `.rgss` archive into the input directory, unless the system file is already there.
-    ///
-    /// Entry names are decoded with `encoding` (UTF-8 when unset) - the same codepage the game's text is in, which
-    /// is also what older archives use for their names. Entries that don't decode are skipped with a warning
-    /// rather than written under a mangled name that could collide with another entry.
-    fn extract_archive(&self, encoding: Option<&'static Encoding>) -> Result<(), anyhow::Error> {
+    /// Extracts the `.rgss` archive into the input directory unless the system file already exists. Names decode with
+    /// `--archive-read-encoding`, else `read_encoding` (UTF-8 if neither is set). Undecodable entries are skipped with a
+    /// warning rather than written under a colliding name.
+    fn extract_archive(&self, read_encoding: Option<&'static Encoding>) -> Result<(), anyhow::Error> {
         let Some(archive_path) = &self.archive_path else {
             return Ok(());
         };
@@ -826,17 +822,20 @@ impl<'a> Session<'a> {
             return Ok(());
         }
 
-        let encoding = encoding.unwrap_or(UTF_8);
-        let mut archive_data = read(archive_path).with_context(|| archive_path.display().to_string())?;
-        let mut decrypter = Decrypter::new();
+        let encoding = self.archive_read_encoding.or(read_encoding).unwrap_or(UTF_8);
+        // Entries are decrypted one at a time as they're read, so the archive itself never has to fit in memory.
+        let mut archive = decrypt_from_reader(BufReader::new(
+            File::open(archive_path).with_context(|| archive_path.display().to_string())?,
+        ))?;
         let mut skipped: usize = 0;
 
-        for file in decrypter.decrypt(&mut archive_data)? {
-            let Some(decoded) = encoding.decode_without_bom_handling_and_without_replacement(file.path) else {
+        for index in 0..archive.entry_count() {
+            let raw_path = archive.path(index);
+            let Some(decoded) = encoding.decode_without_bom_handling_and_without_replacement(raw_path) else {
                 eprintln!(
                     "warning: skipped an archive entry, its name isn't valid {}: {}",
                     encoding.name(),
-                    String::from_utf8_lossy(file.path)
+                    String::from_utf8_lossy(raw_path)
                 );
                 skipped += 1;
                 continue;
@@ -864,13 +863,16 @@ impl<'a> Session<'a> {
                 create_dir_all(parent)?;
             }
 
-            write(&output_file_path, file.data).with_context(|| output_file_path.display().to_string())?;
+            // `path` and `raw_path` borrow the archive, so they must be dead before the entry is read below.
+            let mut entry = archive.read_entry(index)?;
+            let mut output = File::create(&output_file_path).with_context(|| output_file_path.display().to_string())?;
+            copy(&mut entry, &mut output).with_context(|| output_file_path.display().to_string())?;
         }
 
         if skipped > 0 {
             eprintln!(
                 "warning: {skipped} archive entries were skipped. If they matter, pass the right codepage to \
-                 `--read-encoding` and run again."
+                 `--archive-read-encoding` and run again."
             );
         }
 
@@ -897,13 +899,14 @@ impl<'a> Session<'a> {
         } = args.shared;
 
         let file_flags = FileFlags::all() & !skip_files.0;
+        // Resolved before anything is prompted or written, so a typo fails the run without side effects.
+        let skip_events = self.skip_event_kinds(skip_events)?;
 
         let Mode::Read { append, force } = read_mode else {
             unreachable!("the read-mode parser only accepts `Read` variants")
         };
 
-        // Without `append` the metadata is only a source of settings, so a broken file must not stop a re-read that
-        // is about to replace it.
+        // Without `append`, metadata only supplies settings, so a broken file must not block a re-read that replaces it.
         let recorded = match parse_metadata(&self.metadata_file_path) {
             Ok(recorded) => recorded,
             Err(error) if !append => {
@@ -912,6 +915,10 @@ impl<'a> Session<'a> {
             }
             Err(error) => return Err(error),
         };
+
+        let text_settings_changed = recorded
+            .as_ref()
+            .is_some_and(|recorded| self.text_settings_changed(cli_map_events, recorded));
 
         let Metadata {
             duplicate_mode,
@@ -925,8 +932,14 @@ impl<'a> Session<'a> {
 
         apply_format_overrides(line_separator.as_ref(), line_break.as_ref(), comment_prefix.as_ref());
 
-        // The hashes decide which files are skipped as unchanged, so only an append may build on the recorded ones.
-        let hashes = if append { hashes.unwrap_or_default() } else { HashMap::default() };
+        // Hashes decide which files are skipped as unchanged, so only `append` may reuse the recorded ones, and not
+        // when a text setting changed: hashes cover only the game files' bytes, so unchanged files would keep the old
+        // decoding or formatting.
+        let hashes = if append && !text_settings_changed {
+            hashes.unwrap_or_default()
+        } else {
+            HashMap::default()
+        };
 
         if force && !silent {
             let start = Instant::now();
@@ -935,9 +948,9 @@ impl<'a> Session<'a> {
             let mut buf = String::with_capacity(4);
             stdin().read_line(&mut buf)?;
 
+            // Non-zero exit, so a script can't mistake a read that never ran for a successful one.
             if buf.trim_end() != "Y" {
-                println!("Aborted.");
-                exit(0);
+                bail!("Aborted.");
             }
 
             // The time spent waiting for the answer isn't the tool's.
@@ -964,11 +977,7 @@ impl<'a> Session<'a> {
             game_title: self.ini_game_title(use_ini_title, resolved_read_encoding),
             hashes,
             skip_maps: skip_maps.0,
-            skip_events: skip_events
-                .0
-                .into_iter()
-                .filter_map(|(name, ids)| resolve_file_type(&name, self.engine_type).map(|ft| (ft, ids)))
-                .collect(),
+            skip_events,
             map_events,
             read_encoding: resolved_read_encoding,
             write_encoding: None,
@@ -1005,6 +1014,7 @@ impl<'a> Session<'a> {
         } = args;
 
         let file_flags = FileFlags::all() & !skip_files.0;
+        let skip_events = self.skip_event_kinds(skip_events)?;
         let write_encoding = self.write_encoding.clone();
 
         // Event headers are comments in the translation files, `write` has nothing to do with them.
@@ -1025,11 +1035,7 @@ impl<'a> Session<'a> {
             flags: BaseFlags::empty(),
             duplicate_mode,
             skip_maps: skip_maps.0,
-            skip_events: skip_events
-                .0
-                .into_iter()
-                .filter_map(|(name, ids)| resolve_file_type(&name, self.engine_type).map(|ft| (ft, ids)))
-                .collect(),
+            skip_events,
             read_encoding: resolve_encoding(read_encoding.as_deref()),
             write_encoding: resolve_encoding(write_encoding.as_deref()),
             ..Default::default()
@@ -1054,6 +1060,7 @@ impl<'a> Session<'a> {
         } = args.shared;
 
         let file_flags = FileFlags::all() & !skip_files.0;
+        let skip_events = self.skip_event_kinds(skip_events)?;
         let create_ignore = args.create_ignore;
 
         // Without the headers on, purge rewrites the map files and drops the ones `read --map-events` wrote.
@@ -1065,7 +1072,11 @@ impl<'a> Session<'a> {
             read_encoding,
             map_events,
             ..
-        } = self.merge_metadata(duplicate_mode, args.map_events, parse_metadata(&self.metadata_file_path)?);
+        } = self.merge_metadata(
+            duplicate_mode,
+            args.map_events,
+            parse_metadata(&self.metadata_file_path)?,
+        );
 
         apply_format_overrides(line_separator.as_ref(), line_break.as_ref(), comment_prefix.as_ref());
 
@@ -1078,11 +1089,7 @@ impl<'a> Session<'a> {
             flags,
             duplicate_mode,
             skip_maps: skip_maps.0,
-            skip_events: skip_events
-                .0
-                .into_iter()
-                .filter_map(|(name, ids)| resolve_file_type(&name, self.engine_type).map(|ft| (ft, ids)))
-                .collect(),
+            skip_events,
             map_events,
             read_encoding: resolve_encoding(read_encoding.as_deref()),
             write_encoding: None,
@@ -1123,11 +1130,13 @@ impl<'a> Session<'a> {
         match subcommand {
             JsonSubcommand::Generate { read_mode } => {
                 let force = matches!(read_mode, Mode::Read { force: true, .. });
-                self.extract_archive(resolve_encoding(self.read_encoding.as_deref()))?;
-                generate(&self.source_path, &json_path, force)?;
+                let read_encoding = resolve_encoding(self.read_encoding.as_deref());
+                self.extract_archive(read_encoding)?;
+                generate(&self.source_path, &json_path, force, read_encoding)?;
             }
             JsonSubcommand::Write => {
-                write(json_path, json_output_path, self.engine_type)?;
+                let write_encoding = resolve_encoding(self.write_encoding.as_deref());
+                write(json_path, json_output_path, self.engine_type, write_encoding)?;
             }
         }
 
@@ -1151,8 +1160,8 @@ impl<'a> Session<'a> {
             SerdeSubcommand::Export { format } => {
                 create_dir_all(&serde_path)?;
 
-                for entry in read_dir(&self.translation_path)?.flatten() {
-                    let path = entry.path();
+                for entry in read_dir(&self.translation_path)? {
+                    let path = entry?.path();
 
                     if path.extension().and_then(|ext| ext.to_str()) != Some("txt") {
                         continue;
@@ -1187,8 +1196,8 @@ impl<'a> Session<'a> {
                 // directory half-imported.
                 let mut imported = Vec::new();
 
-                for entry in read_dir(&serde_path)?.flatten() {
-                    let path = entry.path();
+                for entry in read_dir(&serde_path)? {
+                    let path = entry?.path();
 
                     if path.extension().and_then(|ext| ext.to_str()) != Some(format.extension()) {
                         continue;
@@ -1236,6 +1245,19 @@ fn main() -> Result<()> {
         .with_max_level(cli.verbosity)
         .init();
 
+    // These commands don't read a game, so they run before `Session` looks for one in the input directory.
+    if let Command::Asset { options, command } = &cli.command {
+        execute_asset(options, *command, &cli.input_dir, cli.output_dir.as_deref())?;
+        println!("Elapsed: {:.2}s", start_time.elapsed().as_secs_f32());
+        return Ok(());
+    }
+
+    if let Command::Archive { subcommand } = &cli.command {
+        execute_archive(subcommand, &cli.input_dir, cli.output_dir.as_deref())?;
+        println!("Elapsed: {:.2}s", start_time.elapsed().as_secs_f32());
+        return Ok(());
+    }
+
     let mut session = Session::new(&mut cli, &mut start_time)?;
 
     match cli.command {
@@ -1244,6 +1266,7 @@ fn main() -> Result<()> {
         Command::Purge(args) => session.execute_purge(args)?,
         Command::Json { subcommand } => session.execute_json(&subcommand)?,
         Command::Serde { subcommand } => session.execute_serde(&subcommand)?,
+        Command::Asset { .. } | Command::Archive { .. } => unreachable!("handled before `Session` is created"),
     }
 
     println!("Elapsed: {:.2}s", start_time.elapsed().as_secs_f32());

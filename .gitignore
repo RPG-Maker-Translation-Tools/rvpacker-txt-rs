@@ -1,1 +1,15 @@
-/target
+.DS_Store
+
+.vscode
+.vs
+.zed
+.idea
+
+.agents
+.gemini
+.codex
+.claude
+.cursor
+.codegraph
+
+target

@@ -1,0 +1,111 @@
+## 19.0.0
+
+- Added the `asset` command, which decrypts and encrypts RPG Maker MV/MZ images and audio without parsing a game.
+- Added the `archive` command, which decrypts and encrypts RPG Maker `.rgss` archives without parsing a game.
+- Added `--archive-read-encoding`, which sets the encoding of file names inside an archive separately from `--read-encoding`.
+- **Breaking:** `--skip-events` file names must now match exactly, ignoring case. Partial or misspelled names such as `acts` are an error instead of being matched by their first letters.
+- **Breaking:** `--mode append` keeps translations for text no longer in the game instead of removing them. Add `--skip-obsolete` to remove them.
+
+### From rpgm-asset-decrypter-lib v5.0.0
+
+- **Breaking:** `FileType` variants are renamed to `Png`, `Ogg` and `M4a`.
+- **Breaking:** `encrypt` and `encrypt_in_place` now take a `FileType` as their second argument, and the data is checked against it.
+- **Breaking:** `FileType` and `Error` are now `#[non_exhaustive]`.
+- **Breaking:** `DECRYPTED_ASSETS_EXTS` is renamed to `DECRYPTED_ASSET_EXTS`.
+- **Breaking:** Converting a string to a `FileType` now fails with `Error::UnsupportedExtension` instead of a string error.
+- Decrypting a file encrypted with a different key than the decrypter's now returns `KeyMismatch` instead of corrupt output.
+- Encrypting data that doesn't look like its declared file type now fails with `InvalidContent`.
+- Parsing a `FileType` from an extension now ignores case, so `RPGMVP` is accepted.
+- Added `decrypt_keyed` and `decrypt_in_place_keyed`, which take `&self`, so a keyed decrypter can be shared between threads.
+- Added `decrypted_extension` and `encrypted_extension` to `FileType`.
+- `key()` now always returns lowercase hex, even if the key was set in uppercase.
+- The free `decrypt_in_place` function now returns the decrypted data as a slice.
+- The minimum supported Rust version is now 1.81, up from 1.77.
+- Fixed: a key derived from an M4A file could corrupt PNG and OGG files decrypted after it with the same `Decrypter`. Those files now derive their own key, and the `*_keyed` methods return `KeyMismatch` for them.
+- Deriving a key from an M4A file now fails with `InvalidContent` when no box follows the type box, instead of assuming a 28-byte header.
+
+### From rpgmad-lib v7.0.0
+
+- **Breaking:** `Decrypter` is removed. Use `decrypt` to read an archive and `encrypt` or `encrypt_to_vec` to write one.
+- **Breaking:** `Engine::VXAce` is now `Engine::Vxace`, and `Engine.VXAce` is now `Engine.Vxace` in JavaScript. Rename it in your code.
+- **Breaking:** The C `rpgmard_encrypt` and `rpgmard_encrypted_buffer_size` functions no longer take a scratch buffer, and the decrypter size and alignment functions are removed.
+- **Breaking:** The C `rpgmard_archive_entry_size` and `rpgmard_archive_entry_align` functions and the `RPGMARD_STATUS_SCRATCH_TOO_SMALL` status are removed.
+- **Breaking:** `ExtractError` and `EncryptError` are now `non_exhaustive`, and `Truncated` and `Corrupt` carry a byte offset. Update matches on them.
+- Added streaming decryption and encryption for Rust, so archives can be read and written without loading them fully into memory.
+- Added `encrypt_to_vec`, which returns a finished archive without sizing a buffer by hand.
+- Added a way to get an engine from a file extension such as `.rgss3a`.
+- Added checks for archive paths that would escape the output folder, such as `..` components or absolute paths.
+- Added an `alloc` feature so `no_std` projects can use `encrypt_to_vec`.
+- Added `rpgmard_status_message` to C, which describes any status code.
+- Added `rpgmard_decrypter_entries_left` to C, which reports how many entries remain.
+- Fixed `encryptArchive` in JavaScript returning a zero-filled buffer for archives over 4 GiB. It now throws.
+- Sped up decrypting and encrypting archives.
+- Archives with more than 1,048,576 entries are now rejected with an error, both when reading and when writing (`EncryptError::TooManyEntries` and `RPGMARD_STATUS_TOO_MANY_ENTRIES`).
+- `path_components` and the examples now say that Shift JIS names must be decoded to UTF-8 first. Splitting the raw bytes put some Japanese file names in the wrong folder.
+- `encryptArchive` in JavaScript consumes the `ArchiveEntry` objects you pass it. Create new ones for each call.
+- `encryptArchive` in JavaScript reserves its output up front and reads each entry in chunks, so large archives use less memory.
+- The minimum supported Rust version is now 1.81, up from 1.77.
+
+### From rvpacker-txt-rs-lib v19.0.0
+
+- **Breaking:** `core::Base::new` uses `DuplicateMode::Allow`, as `Processor` does. Set `duplicate_mode` to `Remove` if you relied on the old default.
+- **Breaking:** Map and event ids are `u32`, so `Processor::skip_maps`, `Processor::skip_events`, `Base::skip_maps`, `Base::skip_events` and `Base::parse_map_id` use `u32` instead of `u16`. Ids above 65,535 work.
+- **Breaking:** `content_hash` always uses rapidhash instead of gxhash, so every hash you stored from an earlier version is invalid: the first append after upgrading re-reads every file once, and the new hashes must be stored in place of the old.
+- **Breaking:** `Mode::Write` with no `output_path` writes to `./output` instead of the current directory.
+- **Breaking:** `read_encoding: None` used to guess each text's encoding, for XP/VX and RM2K/2003. It now means UTF-8 everywhere, and nothing is guessed. That includes `get_rm2k_entity_name` and `get_rm2k_system_graphic_name`, which decode UTF-8 for `None`. Text that doesn't decode fails with `Error::InvalidText`.
+- **Breaking:** `Error` has seven new variants: `InvalidText`, `UnmappableText`, `InFile`, `DuplicateSection`, `MapsNotBegun`, `UnsupportedWriteEncoding` and `UnsupportedEngine`. Exhaustive `match` statements need new arms.
+- **Breaking:** `core::Base::set_write_encoding` returns `Result`, and fails with `Error::UnsupportedWriteEncoding` for an encoding that can only decode, such as UTF-16. `Processor::process` returns the same error for such a `write_encoding`.
+- **Breaking:** `core::get_entity_values` takes a `read_encoding` after the engine and decodes untagged Marshal text with it.
+- **Breaking:** `json::generate_file` and `json::generate` take a `read_encoding` for `Scripts`, and `json::write` takes a `write_encoding`. `json::write` with `EngineType::RM2K` returns `Error::UnsupportedEngine` instead of panicking.
+- **Breaking:** A translation file with two sections of the same id fails with `Error::DuplicateSection`, instead of the second replacing the first.
+- **Breaking:** The sections of `Scripts` and `plugins.js` are matched to the game's scripts and plugins by name, not position, so inserting or reordering one no longer shifts the translations after it. New entries get ids past the existing ones. A translation file made by an earlier version is matched by its `<!>NAME` lines.
+- **Breaking:** A trailing `if(...)` on XP/VX/VX Ace text is part of the text instead of being cut off, so existing translations of such lines no longer match. `core::text::ends_with_if_index` is removed.
+- **Breaking:** VX Ace `\et[n]` speaker codes stay in the source text instead of being cut off, so existing translations of those lines no longer match. Append, then translate them again.
+- **Breaking:** `set_line_separator`, `set_line_break` and `set_comment_prefix` panic on an empty value or one with a line feed.
+- A line before the first `<!>ID` line is logged instead of ignored silently.
+- A file saved with a byte order mark, as Notepad does, no longer loses its first section.
+- Append keeps what the game no longer has, instead of dropping it: translations of removed entries (under their own `<!>ID` header, not the previous section's), whole sections of removed entries and maps (after the others, unless `BaseFlags::SkipObsolete` is set), and comments after a section's last entry or in a section without entries.
+- Files are written through a temporary file, flushed, then renamed, so an interrupted write keeps the previous file. This applies to translation files, game data files and `json` output.
+- XP/VX text, map names and display names that happen to be valid UTF-8 honour `read_encoding`. A VX Ace string's declared encoding wins over bytes that happen to be valid UTF-8.
+- Text that can't be encoded in `write_encoding` fails the file with `Error::UnmappableText`, instead of writing `&#NNNN;`.
+- XP/VX message boxes, choices, event text and script names are written as raw bytes, not encoding-tagged strings, and `write_encoding` applies to them.
+- Fixed untranslated event text being erased on write, a map's display name being blanked when it has no translation, `shop_talk` lines losing the space after `=`, and a translation that already starts with a VX Ace speaker prefix getting it twice.
+- Fixed a map or entry whose only text is a line shared with another one (duplicates removed) being left untranslated on write.
+- Fixed the last message box of every XP event list being skipped, and an entry with no name not being processed.
+- The game title in `system.txt` is written back for engines that keep it in the system file. A `game_title` still wins, and is written in `write_encoding`.
+- Fixed `BaseFlags::CreateIgnore` rewriting `.rvpacker-ignore` outside a purge.
+- Fixed RM2K terms entries not matching when duplicates are removed.
+- Fixed a purge with duplicates removed and `BaseFlags::Ignore` writing a collapsed section next to the per-id ones.
+- Fixed `?` in a glob matching one byte instead of one character, and a literal `*` in the text consuming a wildcard.
+- Lines are listed in a stable order.
+- `plugins.js` is written back with its layout and comments, changing only the translated strings. A `=` in a comment above the list, or a missing `var $plugins`, no longer breaks it.
+- Plugin parameters nested more than 256 levels fail with `Error::InvalidPlugins`. They used to fail at 128 levels with `Error::JsonParse`.
+- Fixed a quote in a translated script string ending the Ruby literal early. It is escaped now.
+- Fixed `plugins.js` not being found for source paths `.` and `..`, and a panic when the path has no parent.
+- Files are written back with their original formatting, changing only the translated strings, instead of minified, and keep a byte order mark.
+- Fixed `MapNNN.json` files left over from deleted maps (`null` in `MapInfos`) being processed.
+- Hero names and titles set by events (`Change Hero Name`, `Change Hero Title`) are extracted and translated.
+- Message boxes that hold only symbols are no longer extracted, as on the other engines.
+- `skip_maps`, `skip_events` and the ignore flags (`BaseFlags::Ignore`, `CreateIgnore`) now work.
+- Fixed append dropping the translations of unchanged maps, user comments under a section header moving or duplicating on each append, two consecutive message boxes merging into one entry, and `maps.txt` losing a map's `<!>ID` with `map_events`.
+- After a write, `Processor::game_title` holds the translated title from `terms.txt`, for `RPG_RT.ini`. It is no longer forgotten after the first read on the same `Base`.
+- `RPG_RT.ldb` and `RPG_RT.lmt` load errors name the file.
+- Added `core::Rm2kDatabase`, which loads `RPG_RT.ldb` once for many name lookups.
+- `Processor::process` returns data file parse errors as `Error::InFile`, naming the file. A purge no longer creates an empty output directory.
+- `Processor::process` no longer empties `skip_maps` and `skip_events`, so a second call keeps them. A failed run puts `hashes` back, so the next append doesn't skip files that never reached a translation.
+- `Base::process_map` before `begin_maps` returns `Error::MapsNotBegun` instead of panicking.
+- Fixed `set_line_break` having no effect on `denormalize` once it had been used.
+- `filter_other` no longer picks up `Statistics.json` or `Items_backup.json`. The `Game.ini` title is no longer read from a longer key such as `TitleFont=`.
+- Added a `gxhash` feature: without it the crate builds without AES-NI/Armv8 crypto and maps and sets use rapidhash.
+- `json::generate` checks `Scripts.rb`, not `Scripts.json`, before overwriting without `force`, skips stray files such as `desktop.ini`, and takes separate types for its source and output paths (as do `generate_rm2k` and `write_rm2k`).
+- `Scripts.rb` round trips exactly: CRLF line endings and empty scripts are no longer turned into LF and a lone newline. JSON made by an earlier version loses one trailing newline per script that ended with one.
+- `json::write_rm2k` warns when `RPG_RT.ldb.json` is missing, since the maps are then written as RPG Maker 2000.
+- A file without the `LcfSaveData` header fails with `Error::InvalidSave` instead of reading as an empty RM2K/2003 save.
+- `get_save_summary` honours the encoding a VX Ace string declares.
+- CSV and XLSX import fail when a row's `translation_count` is not a number. XML import fails on an `<entry>` with no `<source>`, and keeps comment text that isn't wrapped in CDATA.
+- A carriage return at the end of the text survives an export and import.
+- The CSV export puts a `'` in front of cells a spreadsheet would read as a formula (starting with `=`, `+`, `-`, `@`, a tab or a carriage return), and the import removes it.
+- Fixed an XML export of a comment containing `]]>` being malformed.
+- Files are processed in parallel on rayon's pool (wrap calls in `rayon::ThreadPool::install` to limit threads).
+- Writing no longer parses maps that have no translation.
+- Fixed panics on malformed event commands and event lists in map and other data files. Such commands are skipped.
